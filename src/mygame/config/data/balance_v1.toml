@@ -6,12 +6,35 @@ simulation_hz = 20
 subpixels = 256
 default_army_size = 500
 
+[ai.easy]
+strategy_interval_ticks = 60
+tactical_interval_ticks = 10
+max_simultaneous_tasks = 3
+planning_depth = 1
+allow_inspire = false
+aggression = 0.5
+retreat_hp_ratio = 0.15
+scout_count = 1
+
 [ai.normal]
 strategy_interval_ticks = 40
 tactical_interval_ticks = 5
 max_simultaneous_tasks = 4
 planning_depth = 2
 allow_inspire = false
+aggression = 0.7
+retreat_hp_ratio = 0.25
+scout_count = 2
+
+[ai.hard]
+strategy_interval_ticks = 30
+tactical_interval_ticks = 4
+max_simultaneous_tasks = 5
+planning_depth = 3
+allow_inspire = true
+aggression = 0.9
+retreat_hp_ratio = 0.35
+scout_count = 3
 
 [tactics]
 max_stamina = 100.0

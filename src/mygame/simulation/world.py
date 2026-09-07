@@ -302,7 +302,12 @@ class World:
         self.events: list[GameEventV1] = []
         self.command_log: list[CommandEnvelopeV1] = []
         self.command_results: list[CommandResultV1] = []
-        self.statistics: dict[str, list[int]] = {"losses": [0, 0]}
+        self.statistics: dict[str, Any] = {
+            "losses": [0, 0],
+            "kills": [0, 0],
+            "losses_by_kind": [{}, {}],
+            "damage_dealt": [0.0, 0.0],
+        }
         self.order_queues: dict[int, list[tuple[int, int, int]]] = {}
         self._flow_fields = FlowFieldCache(self.map, self.balance.terrain_speed)
         self.outcome = GameOutcome.ONGOING
@@ -1387,8 +1392,12 @@ class World:
         if not attacks:
             return
         damage_totals = np.zeros(self.units.count, dtype=np.float32)
-        for _attacker, target, amount in attacks:
+        attacker_factions: dict[int, int] = {}
+        for attacker, target, amount in attacks:
             damage_totals[target] += amount
+            attacker_faction = int(self.units.faction[attacker])
+            attacker_factions[target] = attacker_faction
+            self.statistics["damage_dealt"][attacker_faction] += amount
         first_attacker, first_target, _ = attacks[0]
         self.events.append(
             GameEventV1(
@@ -1406,7 +1415,7 @@ class World:
         self.units.hp[targets] -= damage_totals[targets]
         dead = targets[self.units.hp[targets] <= 0]
         for index in dead:
-            self._kill_unit(int(index))
+            self._kill_unit(int(index), attacker_factions.get(int(index)))
 
     def _guard_intercept(self, target: int) -> int:
         if self.units.kind[target] != int(UnitKind.COMMANDER):
@@ -1560,12 +1569,17 @@ class World:
         for index in dead:
             self._kill_unit(int(index))
 
-    def _kill_unit(self, index: int) -> None:
+    def _kill_unit(self, index: int, killer_faction: int | None = None) -> None:
         if not self.units.alive[index]:
             return
         self.units.alive[index] = False
         faction = int(self.units.faction[index])
+        kind_name = UnitKind(int(self.units.kind[index])).name.lower()
         self.statistics["losses"][faction] += 1
+        losses_by_kind = self.statistics["losses_by_kind"][faction]
+        losses_by_kind[kind_name] = losses_by_kind.get(kind_name, 0) + 1
+        if killer_faction is not None and killer_faction != faction:
+            self.statistics["kills"][killer_faction] += 1
         self.events.append(
             GameEventV1(
                 tick=self.tick,
@@ -1646,8 +1660,15 @@ class World:
             int(entity_id): [(int(order[0]), int(order[1]), int(order[2])) for order in orders]
             for entity_id, orders in payload.get("order_queues", {}).items()
         }
+        saved_stats = payload.get("statistics", {})
         world.statistics = {
-            "losses": [int(value) for value in payload.get("statistics", {}).get("losses", [0, 0])]
+            "losses": [int(v) for v in saved_stats.get("losses", [0, 0])],
+            "kills": [int(v) for v in saved_stats.get("kills", [0, 0])],
+            "losses_by_kind": [
+                {k: int(v) for k, v in d.items()} if isinstance(d, dict) else {}
+                for d in saved_stats.get("losses_by_kind", [{}, {}])
+            ],
+            "damage_dealt": [float(v) for v in saved_stats.get("damage_dealt", [0.0, 0.0])],
         }
         if payload.get("perception") is not None:
             from mygame.perception.fog import FogOfWar

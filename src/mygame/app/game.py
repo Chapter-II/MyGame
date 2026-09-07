@@ -210,6 +210,7 @@ class GameApp:
         self.setup_seed = 20260907
         self.setup_symmetric = True
         self.setup_army_size = 500
+        self.setup_difficulty = "normal"
         self.setup_composition: dict[str, int] = {}
         self._reset_composition()
         self.view_faction: Faction | None = Faction.PLAYER
@@ -249,7 +250,8 @@ class GameApp:
         self.ai = LocalStrategicAI(
             self.world.map.width,
             self.world.map.height,
-            config=self.world.balance.ai["normal"],
+            difficulty=self.setup_difficulty,
+            config=self.world.balance.ai.get(self.setup_difficulty, self.world.balance.ai["normal"]),
         )
         self.recorder = ReplayRecorder(self.world)
         self.replay_player = None
@@ -270,7 +272,7 @@ class GameApp:
             self.ai = LocalStrategicAI(
                 self.world.map.width,
                 self.world.map.height,
-                config=self.world.balance.ai["normal"],
+                config=self.world.balance.ai.get("normal", {}),
             )
             self.recorder = ReplayRecorder(self.world)
             self.replay_player = None
@@ -961,6 +963,11 @@ class GameApp:
                 lambda: setattr(self, "setup_symmetric", not self.setup_symmetric),
             ),
             ("地图种子", str(self.setup_seed), self._next_seed),
+            (
+                "敌方难度",
+                {"easy": "简单", "normal": "普通", "hard": "困难"}[self.setup_difficulty],
+                self._cycle_difficulty,
+            ),
         ]
         mouse = self._logical_mouse(pygame.mouse.get_pos())
         for index, (label, value, action) in enumerate(rows):
@@ -1014,7 +1021,9 @@ class GameApp:
                             partial(self._adjust_composition, kind, delta),
                         )
                     )
-        self._blit_text("敌方 AI：普通 · 相同兵力 · 不使用鼓舞", 138, 520, 14, self.theme.muted)
+        diff_label = {"easy": "简单", "normal": "普通", "hard": "困难"}[self.setup_difficulty]
+        inspire = "可使用鼓舞" if self.setup_difficulty == "hard" else "不使用鼓舞"
+        self._blit_text(f"敌方 AI：{diff_label} · 相同兵力 · {inspire}", 138, 520, 14, self.theme.muted)
         self._draw_action_button(
             pygame.Rect(780, 610, 190, 42), "返回", lambda: setattr(self, "scene", "menu")
         )
@@ -1024,6 +1033,11 @@ class GameApp:
         values = (100, 250, 500, 750)
         self.setup_army_size = values[(values.index(self.setup_army_size) + 1) % len(values)]
         self._reset_composition()
+
+    def _cycle_difficulty(self) -> None:
+        values = ["easy", "normal", "hard"]
+        idx = values.index(self.setup_difficulty)
+        self.setup_difficulty = values[(idx + 1) % len(values)]
 
     def _reset_composition(self) -> None:
         remaining = self.setup_army_size - 5
@@ -1709,32 +1723,61 @@ class GameApp:
         overlay = pygame.Surface(LOGICAL_SIZE, pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 190))
         self.canvas.blit(overlay, (0, 0))
-        panel = pygame.Rect(170, 76, 940, 570)
+        panel = pygame.Rect(80, 50, 1120, 620)
         pygame.draw.rect(self.canvas, self.theme.surface, panel, border_radius=10)
         pygame.draw.rect(self.canvas, self.theme.border, panel, 1, border_radius=10)
-        self._blit_text("指令书与战术入门", 208, 110, 24, self.theme.ink, True)
+        self._blit_text("指令书", panel.centerx, 78, 24, self.theme.ink, True, center=True)
+
         left = [
             "选择与移动",
-            "左键点选或框选，右键移动。按 A 再右键执行攻击移动。",
-            "Ctrl+1–9 保存编组，1–9 选中；方向键直接移动将领。",
+            "左键点选或框选，右键移动。A+右键攻击移动。",
+            "Ctrl+1–9 保存编组，1–9 选中编组，Shift 追加选择。",
+            "方向键直接移动将领。Space 暂停，-/+ 调整速度。",
             "",
-            "文字与语音",
-            "Enter 输入：第一侦察队前往中央",
-            "可用：移动、攻击、搜索、全速、冲锋、分化、征兵、架桥、造船、开路、建塔。",
-            "按住 V 说话，松开后转写。所有结果仍须游戏规则校验。",
+            "文字命令（Enter 输入）",
+            "移动：第一侦察队前往北部中央",
+            "攻击：第1组攻击敌方将领",
+            "搜索：侦察兵搜索东部",
+            "编组：20名初始兵编为第6组",
+            "命名：第6组命名为河西守军",
+            "分化：20名初始兵分化为步兵",
+            "征兵：在最近村庄征召20人",
+            "集火：第1组集火敌方将领",
+            "",
+            "设施命令",
+            "架桥：工兵队在中央架桥",
+            "造船：工兵在西岸造船",
+            "开路：工兵砍伐东侧森林",
+            "建塔：工兵在村庄建塔",
         ]
         right = [
-            "兵种职责",
-            "步兵正面作战；侦察兵开图反隐；工兵改变地形；刺客永久暴露后失去伪装。",
-            "将领的四名护卫存活且在附近时，攻击会优先被护卫拦截。",
+            "战术命令",
+            "全速：第1组全速前进",
+            "冲锋：第1组冲锋",
+            "突击：第1组突击敌方将领",
+            "守卫：第1组守住最近村庄",
             "",
-            "地形与情报",
-            "森林、沼泽和河流降低速度；强渡河流持续损失生命。",
-            "灰暗区域是历史地形，黑色区域未探索；离开视野的敌军不会继续显示。",
-            "Esc 或 F1 返回战场。F5 快速保存，F9 载入。",
+            "载具命令",
+            "登船：第1组登船",
+            "开船：船只前往西岸",
+            "下船：第1组下船",
+            "入塔：第6组进入防御塔",
+            "出塔：第6组离开防御塔",
+            "",
+            "兵种职责",
+            "步兵：正面作战，可入塔获得远程攻击",
+            "侦察兵：速度快、视野大，反隐刺客",
+            "工兵：建造桥梁/船只/道路/防御塔",
+            "刺客：高伤害，暴露后永久可见",
+            "将领：阵亡即败，4名护卫拦截攻击",
+            "",
+            "其他操作",
+            "Esc 返回 / 暂停  F1 指令书",
+            "F5 保存  F9 载入  V 按住说话",
+            "Enter 提交命令  Esc 取消输入",
         ]
-        self._draw_lines(left, 208, 160, 412)
-        self._draw_lines(right, 652, 160, 412)
+        self._draw_lines(left, 108, 112, 490)
+        self._draw_lines(right, 620, 112, 490)
 
     def _draw_lines(self, lines: list[str], x: int, y: int, width: int) -> None:
         cursor = y
@@ -1782,7 +1825,7 @@ class GameApp:
         overlay = pygame.Surface(LOGICAL_SIZE, pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 190))
         self.canvas.blit(overlay, (0, 0))
-        panel = pygame.Rect(350, 146, 580, 430)
+        panel = pygame.Rect(250, 80, 780, 560)
         pygame.draw.rect(self.canvas, self.theme.surface, panel, border_radius=10)
         titles = {
             GameOutcome.PLAYER_WIN: "胜利",
@@ -1797,33 +1840,80 @@ class GameApp:
             if self.world.outcome == GameOutcome.DRAW
             else self.theme.enemy
         )
-        self._blit_text(title, panel.centerx, 194, 32, color, True, center=True)
+        self._blit_text(title, panel.centerx, 118, 32, color, True, center=True)
+
+        # Game duration
+        duration_s = self.world.tick / 20.0
+        minutes = int(duration_s) // 60
+        seconds = int(duration_s) % 60
         self._blit_text(
-            (
-                f"对局帧 {self.world.tick} · 我军损失 {self.stats['player_losses']}"
-                f" · 已知敌军损失 {self.stats['enemy_losses']}"
-            ),
-            panel.centerx,
-            252,
-            15,
-            self.theme.ink,
-            center=True,
+            f"对局时长 {minutes}分{seconds:02d}秒 · {self.world.tick} 帧",
+            panel.centerx, 164, 15, self.theme.muted, center=True,
         )
-        self._blit_text(
-            "回放已保存，包含结构化命令和五秒检查点。",
-            panel.centerx,
-            286,
-            14,
-            self.theme.muted,
-            center=True,
-        )
+
+        # Statistics table
+        stats = self.world.statistics
+        y = 200
+        self._blit_text("战      统", panel.centerx, y, 20, self.theme.ink, True, center=True)
+        y += 40
+
+        # Header
+        self._blit_text("", 310, y, 14, self.theme.muted)
+        self._blit_text("我方", 480, y, 14, self.theme.ally, True, center=True)
+        self._blit_text("敌方", 620, y, 14, self.theme.enemy, True, center=True)
+        y += 30
+
+        # Losses
+        self._blit_text("损失", 310, y, 14, self.theme.muted)
+        self._blit_text(str(stats["losses"][0]), 480, y, 15, self.theme.ink, True, center=True)
+        self._blit_text(str(stats["losses"][1]), 620, y, 15, self.theme.ink, True, center=True)
+        y += 28
+
+        # Kills
+        self._blit_text("击杀", 310, y, 14, self.theme.muted)
+        self._blit_text(str(stats.get("kills", [0, 0])[0]), 480, y, 15, self.theme.ink, True, center=True)
+        self._blit_text(str(stats.get("kills", [0, 0])[1]), 620, y, 15, self.theme.ink, True, center=True)
+        y += 28
+
+        # Damage dealt
+        dmg = stats.get("damage_dealt", [0.0, 0.0])
+        self._blit_text("输出伤害", 310, y, 14, self.theme.muted)
+        self._blit_text(f"{dmg[0]:.0f}", 480, y, 15, self.theme.ink, True, center=True)
+        self._blit_text(f"{dmg[1]:.0f}", 620, y, 15, self.theme.ink, True, center=True)
+        y += 28
+
+        # Per-unit-type losses breakdown
+        kind_names = {
+            "recruit": "初始兵", "infantry": "步兵", "scout": "侦察兵",
+            "engineer": "工兵", "assassin": "刺客", "commander": "将领", "guard": "护卫",
+        }
+        losses_by_kind = stats.get("losses_by_kind", [{}, {}])
+        has_breakdown = any(losses_by_kind[0]) or any(losses_by_kind[1])
+        if has_breakdown:
+            y += 10
+            self._blit_text("兵种损失明细", panel.centerx, y, 15, self.theme.ink, True, center=True)
+            y += 26
+            all_kinds = sorted(set(list(losses_by_kind[0].keys()) + list(losses_by_kind[1].keys())))
+            for kind in all_kinds:
+                label = kind_names.get(kind, kind)
+                p_loss = losses_by_kind[0].get(kind, 0)
+                e_loss = losses_by_kind[1].get(kind, 0)
+                if p_loss == 0 and e_loss == 0:
+                    continue
+                self._blit_text(label, 310, y, 13, self.theme.muted)
+                self._blit_text(str(p_loss), 480, y, 14, self.theme.ink, center=True)
+                self._blit_text(str(e_loss), 620, y, 14, self.theme.ink, center=True)
+                y += 22
+
+        # Buttons
+        y = max(y + 20, 470)
         mouse = self._logical_mouse(pygame.mouse.get_pos())
         options = [
             ("再来一局", self.new_battle),
             ("返回主菜单", lambda: setattr(self, "scene", "menu")),
         ]
         for index, (label, action) in enumerate(options):
-            rect = pygame.Rect(470, 352 + index * 58, 340, 42)
+            rect = pygame.Rect(420, y + index * 54, 340, 42)
             pygame.draw.rect(
                 self.canvas,
                 self.theme.primary_hover
