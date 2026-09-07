@@ -289,6 +289,39 @@ class RuleCommandParser:
                 source=source,
                 payload=GuardPayloadV1(selection=selection, target=target),
             )
+        elif "撤退" in cleaned or "撤回" in cleaned or "逃跑" in cleaned or "后撤" in cleaned:
+            # Retreat toward own spawn zone
+            if observation.own_units:
+                avg_x = sum(u.x for u in observation.own_units) / len(observation.own_units)
+                avg_y = sum(u.y for u in observation.own_units) / len(observation.own_units)
+            else:
+                avg_x, avg_y = self.world_width * 0.5, self.world_height * 0.5
+            # Move away from enemies
+            if observation.visible_enemies:
+                enemy_x = sum(e.x for e in observation.visible_enemies) / len(observation.visible_enemies)
+                enemy_y = sum(e.y for e in observation.visible_enemies) / len(observation.visible_enemies)
+                dx = avg_x - enemy_x
+                dy = avg_y - enemy_y
+                dist = (dx * dx + dy * dy) ** 0.5 or 1.0
+                retreat_x = avg_x + dx / dist * 300
+                retreat_y = avg_y + dy / dist * 300
+            else:
+                # Default: retreat toward own side
+                retreat_x = self.world_width * 0.85 if int(observation.faction) == 0 else self.world_width * 0.15
+                retreat_y = self.world_height * 0.5
+            retreat_x = max(0.0, min(self.world_width, retreat_x))
+            retreat_y = max(0.0, min(self.world_height, retreat_y))
+            envelope = CommandEnvelopeV1(
+                command_id=command_id,
+                faction=observation.faction,
+                issued_tick=observation.tick,
+                source=source,
+                payload=MovePayloadV1(
+                    kind="move",
+                    selection=selection,
+                    target=PositionV1(x=retreat_x, y=retreat_y),
+                ),
+            )
         elif any(
             word in cleaned
             for word in ("前往", "移动", "出发", "攻击", "进攻", "搜索", "侦察", "守住")
@@ -613,6 +646,10 @@ _ACTION_TEMPLATES: dict[str, list[str]] = {
     "保护 护卫 集结": [
         "保护将领",
         "所有人集结保护将领",
+    ],
+    "撤退 撤回 后撤 逃跑": [
+        "{group}撤退",
+        "所有人撤退",
     ],
     "冲锋 突击": [
         "{group}冲锋",
