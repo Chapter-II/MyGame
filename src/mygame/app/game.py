@@ -194,6 +194,7 @@ class GameApp:
         self.selected_ids: set[int] = set()
         self.drag_start: tuple[int, int] | None = None
         self.command_input = ""
+        self.composition = ""
         self.typing = False
         self.messages: list[tuple[str, tuple[int, int, int]]] = []
         self.paused = False
@@ -327,6 +328,15 @@ class GameApp:
     def _battle_event(self, event: pygame.event.Event) -> None:
         if self.world is None or self.camera is None:
             return
+        if event.type == pygame.TEXTINPUT and self.typing:
+            if len(self.command_input) + len(event.text) <= 120:
+                self.command_input += event.text
+            self.composition = ""
+            self._update_ime_rect()
+            return
+        if event.type == pygame.TEXTEDITING and self.typing:
+            self.composition = event.text
+            return
         if self.scene == "result" and event.type == pygame.MOUSEBUTTONUP and event.button == 1:
             point = self._logical_mouse(event.pos)
             for button in self.buttons:
@@ -367,14 +377,13 @@ class GameApp:
             if self.typing:
                 if event.key == pygame.K_ESCAPE:
                     self.typing = False
+                    self.composition = ""
+                    if hasattr(pygame.key, "stop_text_input"):
+                        pygame.key.stop_text_input()
                 elif event.key == pygame.K_RETURN:
                     self._submit_text()
                 elif event.key == pygame.K_BACKSPACE:
                     self.command_input = self.command_input[:-1]
-                elif (
-                    event.unicode and event.unicode.isprintable() and len(self.command_input) < 120
-                ):
-                    self.command_input += event.unicode
                 return
             if (
                 self.scene == "battle"
@@ -393,6 +402,10 @@ class GameApp:
             if event.key == pygame.K_RETURN:
                 self.typing = True
                 self.command_input = ""
+                self.composition = ""
+                if hasattr(pygame.key, "start_text_input"):
+                    self._update_ime_rect()
+                    pygame.key.start_text_input()
             elif event.key == pygame.K_ESCAPE:
                 if self.help_open:
                     self.help_open = False
@@ -515,6 +528,9 @@ class GameApp:
         text = self.command_input.strip()
         self.typing = False
         self.command_input = ""
+        self.composition = ""
+        if hasattr(pygame.key, "stop_text_input"):
+            pygame.key.stop_text_input()
         parsed = self.rule_parser.parse(text, self.world.observation(Faction.PLAYER))
         if parsed.status == CommandStatus.PENDING and parsed.candidates:
             if len(parsed.candidates) > 1:
@@ -539,6 +555,20 @@ class GameApp:
             self._message("离线规则未识别，正在请求 DeepSeek……", self.theme.warning)
         else:
             self._message(parsed.message_zh, self.theme.enemy)
+
+    def _update_ime_rect(self) -> None:
+        if not hasattr(pygame.key, "set_text_input_rect"):
+            return
+        viewport = self._viewport()
+        scale = viewport.width / LOGICAL_SIZE[0]
+        box = pygame.Rect(340, 618, 590, 42)
+        screen_rect = pygame.Rect(
+            viewport.x + int(box.x * scale),
+            viewport.y + int(box.y * scale),
+            int(box.width * scale),
+            int(box.height * scale),
+        )
+        pygame.key.set_text_input_rect(screen_rect)
 
     def _retry_provider(self) -> None:
         if self.world is None or not self.pending_retry_text or self.pending_text is not None:
@@ -1554,7 +1584,7 @@ class GameApp:
             pygame.draw.rect(self.canvas, self.theme.background, box, border_radius=6)
             pygame.draw.rect(self.canvas, self.theme.primary, box, 2, border_radius=6)
             self._blit_text(
-                self.command_input + "│", box.x + 12, box.centery, 15, self.theme.ink, center_y=True
+                self.command_input + self.composition + "│", box.x + 12, box.centery, 15, self.theme.ink, center_y=True
             )
             self._blit_text("Enter 执行 · Esc 取消", 340, 674, 12, self.theme.muted)
         else:
