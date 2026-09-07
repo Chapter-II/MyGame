@@ -691,6 +691,32 @@ class World:
             return self._result(
                 command, CommandStatus.REJECTED, "empty_selection", "没有可执行守卫任务的单位。"
             )
+        # Check if this is a "protect commander" command (guard target near commander)
+        cmd_idx = self.commander_index(command.faction)
+        is_protect = False
+        if cmd_idx is not None:
+            cx, cy = float(self.units.x[cmd_idx]) / self.subpixels, float(self.units.y[cmd_idx]) / self.subpixels
+            dist_sq = (payload.target.x - cx) ** 2 + (payload.target.y - cy) ** 2
+            if dist_sq < 50**2:
+                is_protect = True
+        if is_protect and cmd_idx is not None:
+            # Circle formation around commander
+            cx = float(self.units.x[cmd_idx]) / self.subpixels
+            cy = float(self.units.y[cmd_idx]) / self.subpixels
+            n = len(indices)
+            radius = max(60.0, 18.0 * math.sqrt(n))
+            for i, idx in enumerate(indices):
+                angle = 2 * math.pi * i / n - math.pi / 2
+                tx = cx + radius * math.cos(angle)
+                ty = cy + radius * math.sin(angle)
+                self.units.target_x[idx] = int(tx * self.subpixels)
+                self.units.target_y[idx] = int(ty * self.subpixels)
+                self.units.order[idx] = int(Order.GUARD)
+                self.units.focus_target[idx] = -1
+            return self._result(
+                command, CommandStatus.ACCEPTED, "ok",
+                f"{len(indices)} 名单位正在将领周围集结保护。",
+            )
         offsets = self._formation_offsets(len(indices), 20.0)
         self.units.target_x[indices] = np.rint(
             (payload.target.x + offsets[:, 0]) * self.subpixels

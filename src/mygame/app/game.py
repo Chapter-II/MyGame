@@ -196,6 +196,8 @@ class GameApp:
         self.command_input = ""
         self.composition = ""
         self.typing = False
+        self.suggestions: list[str] = []
+        self.selected_suggestion = 0
         self.messages: list[tuple[str, tuple[int, int, int]]] = []
         self.paused = False
         self.speed = 1.0
@@ -1402,6 +1404,13 @@ class GameApp:
             for item in self.world.facilities
             if item.complete and item.kind in {"tower", "boat"}
         }
+        # Per-unit-kind colors
+        kind_colors = {
+            UnitKind.INFANTRY: (220, 60, 60),     # red
+            UnitKind.SCOUT: (70, 130, 230),       # blue
+            UnitKind.ENGINEER: (230, 200, 50),    # yellow
+            UnitKind.ASSASSIN: (170, 80, 220),    # purple
+        }
         for index in self.world.units.active():
             if int(self.world.units.facility_id[index]) in concealed_facilities:
                 continue
@@ -1421,7 +1430,12 @@ class GameApp:
                 continue
             kind = UnitKind(int(self.world.units.kind[index]))
             radius = max(2, min(7, round(self.world.units.radius[index] * self.camera.zoom + 1)))
-            color = self.theme.ally if faction == 0 else self.theme.enemy
+            color = kind_colors.get(kind, self.theme.ally if faction == 0 else self.theme.enemy)
+            if kind == UnitKind.COMMANDER:
+                color = self.theme.warning
+            # Enemy black halo
+            if faction == 1:
+                pygame.draw.circle(self.canvas, (0, 0, 0), (sx, sy), radius + 3)
             if kind == UnitKind.COMMANDER:
                 pygame.draw.circle(self.canvas, self.theme.warning, (sx, sy), radius + 4, 2)
             if faction == 0:
@@ -1756,6 +1770,7 @@ class GameApp:
             "冲锋：第1组冲锋",
             "突击：第1组突击敌方将领",
             "守卫：第1组守住最近村庄",
+            "保护：保护将领（全员围成一圈）",
             "",
             "载具命令",
             "登船：第1组登船",

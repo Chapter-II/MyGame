@@ -35,6 +35,7 @@ class RuleCommandParser:
         self.world_width = world_width
         self.world_height = world_height
         self.group_names = group_names or {}
+        self.suggester = CommandSuggester(world_width, world_height)
 
     def parse(self, text: str, observation: ObservationSnapshotV1) -> CommandResultV1:
         cleaned = re.sub(r"[，。！？,.!?]", " ", text.strip())
@@ -256,6 +257,30 @@ class RuleCommandParser:
                     selection=selection, target_entity_id=chosen_enemy.entity_id
                 ),
             )
+        elif "保护" in cleaned:
+            # Protect commander: all units rally around commander
+            commander = next(
+                (u for u in observation.own_units if u.kind == "commander"), None
+            )
+            if commander:
+                protect_selection = SelectionV1()  # empty = all units
+                envelope = CommandEnvelopeV1(
+                    command_id=command_id,
+                    faction=observation.faction,
+                    issued_tick=observation.tick,
+                    source=source,
+                    payload=GuardPayloadV1(
+                        selection=protect_selection,
+                        target=PositionV1(x=commander.x, y=commander.y),
+                    ),
+                )
+            else:
+                return CommandResultV1(
+                    command_id=command_id,
+                    status=CommandStatus.REJECTED,
+                    reason_code="no_commander",
+                    message_zh="未找到将领。",
+                )
         elif "守卫" in cleaned or "守住" in cleaned or "驻守" in cleaned:
             envelope = CommandEnvelopeV1(
                 command_id=command_id,
@@ -400,3 +425,216 @@ class RuleCommandParser:
                 )
                 x, y = float(village["x"]), float(village["y"])
         return PositionV1(x=x, y=y)
+
+
+class CommandSuggester:
+    """Context-aware command autocomplete based on partial input."""
+
+    def __init__(self, world_width: int = 4096, world_height: int = 2304) -> None:
+        self.world_width = world_width
+        self.world_height = world_height
+
+    def suggest(self, text: str, observation: ObservationSnapshotV1) -> list[str]:
+        cleaned = re.sub(r"[，。！？,.!?]", "", text.strip()).lower()
+        if not cleaned or len(cleaned) < 1:
+            return self._default_suggestions(observation)
+
+        suggestions: list[str] = []
+
+        # Unit-kind based suggestions
+        for keywords, templates in _UNIT_TEMPLATES.items():
+            if any(kw in cleaned for kw in keywords.split()):
+                for tpl in templates:
+                    suggestion = self._fill_template(tpl, cleaned, observation)
+                    if suggestion and suggestion not in suggestions:
+                        suggestions.append(suggestion)
+                break
+
+        # Action-keyword based suggestions
+        for keywords, templates in _ACTION_TEMPLATES.items():
+            if any(kw in cleaned for kw in keywords.split()):
+                for tpl in templates:
+                    suggestion = self._fill_template(tpl, cleaned, observation)
+                    if suggestion and suggestion not in suggestions:
+                        suggestions.append(suggestion)
+                break
+
+        # If no specific match, try generic partial matching
+        if not suggestions:
+            for keywords, templates in _UNIT_TEMPLATES.items():
+                if any(cleaned.startswith(kw[:len(cleaned)]) for kw in keywords.split()):
+                    for tpl in templates[:2]:
+                        suggestion = self._fill_template(tpl, cleaned, observation)
+                        if suggestion and suggestion not in suggestions:
+                            suggestions.append(suggestion)
+                    break
+
+        return suggestions[:3]
+
+    def _default_suggestions(self, obs: ObservationSnapshotV1) -> list[str]:
+        suggestions = ["第一战团前往中央", "侦察队搜索东部", "工兵在中央架桥"]
+        # Add context-aware default if enemies visible
+        if obs.visible_enemies:
+            cmd = next((u for u in obs.visible_enemies if u.kind == "commander"), None)
+            if cmd:
+                suggestions[0] = "第一战团集火敌方将领"
+        return suggestions[:3]
+
+    def _fill_template(
+        self, tpl: str, cleaned: str, obs: ObservationSnapshotV1
+    ) -> str | None:
+        result = tpl
+
+        # Fill group references
+        if "{group}" in result:
+            group = self._detect_group(cleaned)
+            result = result.replace("{group}", f"第{group}组" if group else "第一战团")
+
+        # Fill direction
+        if "{direction}" in result:
+            direction = self._detect_direction(cleaned)
+            result = result.replace("{direction}", direction)
+
+        # Fill target village
+        if "{village}" in result:
+            if obs.known_villages:
+                anchor = obs.own_units[0] if obs.own_units else None
+                if anchor:
+                    nearest = min(
+                        obs.known_villages,
+                        key=lambda v: (float(v["x"]) - anchor.x) ** 2 + (float(v["y"]) - anchor.y) ** 2,
+                    )
+                    result = result.replace("{village}", "最近村庄")
+                else:
+                    result = result.replace("{village}", "最近村庄")
+            else:
+                return None
+
+        # Fill enemy commander reference
+        if "{enemy_cmd}" in result:
+            if obs.visible_enemies:
+                result = result.replace("{enemy_cmd}", "敌方将领")
+            else:
+                return None
+
+        return result
+
+    @staticmethod
+    def _detect_group(text: str) -> str | None:
+        match = re.search(r"第?\s*([1-9一二三四五六七八九])", text)
+        if match:
+            return match.group(1)
+        return None
+
+    @staticmethod
+    def _detect_direction(text: str) -> str:
+        if "东" in text:
+            return "东部"
+        if "西" in text:
+            return "西部"
+        if "北" in text:
+            return "北部"
+        if "南" in text:
+            return "南部"
+        return "中央"
+
+
+# Suggestion templates: keyword → list of templates
+# Placeholders: {group}, {direction}, {village}, {enemy_cmd}
+
+_UNIT_TEMPLATES: dict[str, list[str]] = {
+    "侦察兵 侦察队 侦察": [
+        "侦察兵搜索{direction}",
+        "侦察队前往{direction}侦察",
+        "侦察兵前往{village}侦察",
+    ],
+    "步兵": [
+        "步兵前往{direction}",
+        "步兵攻击{enemy_cmd}",
+        "步兵守住{village}",
+    ],
+    "工兵": [
+        "工兵在{direction}架桥",
+        "工兵造船",
+        "工兵在{village}建塔",
+        "工兵砍伐{direction}森林",
+    ],
+    "刺客 影刃": [
+        "刺客攻击{enemy_cmd}",
+        "刺客前往{direction}搜索",
+    ],
+    "将领": [
+        "将领前往{direction}",
+        "将领守住{village}",
+    ],
+    "初始兵 预备兵": [
+        "初始兵分化为步兵",
+        "初始兵分化为侦察兵",
+        "初始兵分化为工兵",
+    ],
+}
+
+_ACTION_TEMPLATES: dict[str, list[str]] = {
+    "前往 移动 出发 去": [
+        "{group}前往{direction}",
+        "{group}前往{village}",
+    ],
+    "攻击 进攻 打": [
+        "{group}攻击{enemy_cmd}",
+        "{group}攻击{direction}敌军",
+    ],
+    "搜索 侦察 探索": [
+        "{group}搜索{direction}",
+        "侦察兵搜索{direction}",
+    ],
+    "架桥 桥": [
+        "工兵在{direction}架桥",
+        "工兵在{village}附近架桥",
+    ],
+    "造船 船": [
+        "工兵在{direction}造船",
+    ],
+    "建塔 塔": [
+        "工兵在{village}建塔",
+    ],
+    "征召 征兵 招兵": [
+        "在{village}征召20人",
+    ],
+    "编组 编入 编为": [
+        "{group}编为第1组",
+    ],
+    "集火": [
+        "{group}集火{enemy_cmd}",
+    ],
+    "守卫 守住 驻守": [
+        "{group}守住{village}",
+        "{group}驻守{direction}",
+    ],
+    "保护 护卫 集结": [
+        "保护将领",
+        "所有人集结保护将领",
+    ],
+    "冲锋 突击": [
+        "{group}冲锋",
+        "{group}突击{enemy_cmd}",
+    ],
+    "全速": [
+        "{group}全速前进",
+    ],
+    "登船": [
+        "{group}登船",
+    ],
+    "入塔": [
+        "{group}进入防御塔",
+    ],
+    "摧毁": [
+        "摧毁敌方桥梁",
+        "摧毁敌方防御塔",
+    ],
+    "分化 训练 转为": [
+        "初始兵分化为步兵",
+        "初始兵分化为侦察兵",
+        "初始兵分化为工兵",
+        "初始兵分化为刺客",
+    ],
+}
