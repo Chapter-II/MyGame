@@ -157,6 +157,12 @@ class Camera:
 
 class GameApp:
     def __init__(self) -> None:
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            except Exception:
+                pass
         pygame.init()
         pygame.font.init()
         self.theme = Theme()
@@ -172,6 +178,7 @@ class GameApp:
         self.running = True
         self.scene = "menu"
         self.buttons: list[Button] = []
+        self.menu_focus = 0
         self.world: World | None = None
         self.camera: Camera | None = None
         self.ai: LocalStrategicAI | None = None
@@ -209,6 +216,8 @@ class GameApp:
         self.stats = {"player_losses": 0, "enemy_losses": 0}
         self.result_sound_played = False
         self.tick_timings: deque[float] = deque(maxlen=240)
+        self._terrain_cache: pygame.Surface | None = None
+        self._terrain_cache_key: tuple = ()
         self.setup_seed = 20260907
         self.setup_symmetric = True
         self.setup_army_size = 500
@@ -240,6 +249,8 @@ class GameApp:
         self.scene = "setup"
 
     def new_battle(self) -> None:
+        self._terrain_cache = None
+        self._terrain_cache_key = ()
         battle_map = generate_map(seed=self.setup_seed, symmetric=self.setup_symmetric)
         self.world = World(
             battle_map=battle_map,
@@ -313,6 +324,9 @@ class GameApp:
                 self.running = False
             elif event.type == pygame.VIDEORESIZE and not self.fullscreen:
                 self.screen = pygame.display.set_mode(event.size, pygame.RESIZABLE)
+            elif event.type == pygame.WINDOWFOCUSLOST and self.recording:
+                self.recording = False
+                self._message("窗口失焦，语音录制已取消。", self.theme.warning)
             elif self.scene in {"menu", "setup", "settings", "tutorial"}:
                 self._menu_event(event)
             elif self.scene in {"battle", "replay", "result"}:
@@ -322,11 +336,31 @@ class GameApp:
         if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
             self.scene = "menu"
             return
+        if event.type == pygame.KEYDOWN:
+            enabled_buttons = [b for b in self.buttons if b.enabled]
+            if not enabled_buttons:
+                return
+            if event.key in (pygame.K_TAB, pygame.K_DOWN):
+                self.menu_focus = (self.menu_focus + 1) % len(enabled_buttons)
+                return
+            if event.key == pygame.K_UP:
+                self.menu_focus = (self.menu_focus - 1) % len(enabled_buttons)
+                return
+            if event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                if 0 <= self.menu_focus < len(enabled_buttons):
+                    enabled_buttons[self.menu_focus].action()
+                return
         if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
             point = self._logical_mouse(event.pos)
-            for button in self.buttons:
+            for index, button in enumerate(self.buttons):
                 if button.enabled and button.rect.collidepoint(point):
                     button.action()
+                    # Update focus to clicked button
+                    enabled_buttons = [b for b in self.buttons if b.enabled]
+                    try:
+                        self.menu_focus = enabled_buttons.index(button)
+                    except ValueError:
+                        pass
                     break
 
     def _battle_event(self, event: pygame.event.Event) -> None:
@@ -1257,19 +1291,27 @@ class GameApp:
     def _draw_action_button(
         self, rect: pygame.Rect, label: str, action: Callable[[], None], primary: bool = False
     ) -> None:
+        enabled_buttons = [b for b in self.buttons if b.enabled]
+        is_focused = 0 <= self.menu_focus < len(enabled_buttons) and len(enabled_buttons) > 0
+        focused_rect = enabled_buttons[self.menu_focus].rect if is_focused else None
+        keyboard_focused = focused_rect == rect if focused_rect else False
         hovered = rect.collidepoint(self._logical_mouse(pygame.mouse.get_pos()))
         color = (
             self.theme.primary_hover
-            if hovered and primary
+            if (hovered or keyboard_focused) and primary
             else self.theme.primary
             if primary
             else self.theme.surface_high
+            if not keyboard_focused
+            else self.theme.primary
         )
         pygame.draw.rect(self.canvas, color, rect, border_radius=6)
         if not primary:
             pygame.draw.rect(self.canvas, self.theme.border, rect, 1, border_radius=6)
+        if keyboard_focused:
+            pygame.draw.rect(self.canvas, self.theme.ink, rect, 2, border_radius=6)
         self._blit_text(label, rect.centerx, rect.centery, 15, self.theme.ink, True, center=True)
-        self.buttons.append(Button(rect, label, action))
+        self.buttons.append(Button(rect, label, action, enabled=True))
 
     def _draw_battle(self) -> None:
         if self.world is None or self.camera is None:
@@ -1302,38 +1344,71 @@ class GameApp:
             fog = self.world._perception
         if view is not None:
             assert fog is not None
-        colors = [
+
+        # Check if cached terrain is still valid
+        cam_key = (
+            round(self.camera.x, 1),
+            round(self.camera.y, 1),
+            round(self.camera.zoom, 3),
+            int(view) if view is not None else -1,
+            self.world.tick // 10,  # fog updates every 10 ticks
+        )
+        if self._terrain_cache_key == cam_key and self._terrain_cache is not None:
+            self.canvas.blit(self._terrain_cache, BATTLE_RECT.topleft)
+            return
+
+        colors = np.array([
             self.theme.terrain_plain,
             self.theme.terrain_grass,
             self.theme.terrain_forest,
             self.theme.terrain_swamp,
             self.theme.terrain_river,
             self.theme.terrain_road,
-        ]
+        ], dtype=np.uint8)
+
         tile = self.world.map.tile_size
         left, top = self.camera.screen_to_world(BATTLE_RECT.left, BATTLE_RECT.top)
         right, bottom = self.camera.screen_to_world(BATTLE_RECT.right, BATTLE_RECT.bottom)
-        c0, c1 = max(0, int(left // tile)), min(self.world.map.cols, int(right // tile) + 2)
-        r0, r1 = max(0, int(top // tile)), min(self.world.map.rows, int(bottom // tile) + 2)
+        c0 = max(0, int(left // tile))
+        c1 = min(self.world.map.cols, int(right // tile) + 2)
+        r0 = max(0, int(top // tile))
+        r1 = min(self.world.map.rows, int(bottom // tile) + 2)
         size = max(1, math.ceil(tile * self.camera.zoom) + 1)
+
+        # Build pixel buffer
+        w = BATTLE_RECT.width
+        h = BATTLE_RECT.height
+        buf = np.full((w, h, 3), self.theme.fog_unknown, dtype=np.uint8)
+
         for row in range(r0, r1):
             for col in range(c0, c1):
                 sx, sy = self.camera.world_to_screen(col * tile, row * tile)
+                px, py = int(sx - BATTLE_RECT.left), int(sy - BATTLE_RECT.top)
+                if px + size < 0 or py + size < 0 or px >= w or py >= h:
+                    continue
                 if view is None:
                     color = colors[int(self.world.map.terrain[row, col])]
                 else:
                     assert fog is not None
                     if not fog.explored[int(view), row, col]:
-                        color = self.theme.fog_unknown
-                    else:
-                        color = colors[int(self.world.map.terrain[row, col])]
-                        if not fog.visible[int(view), row, col]:
-                            color = (
-                                max(2, color[0] // 3),
-                                max(2, color[1] // 3),
-                                max(2, color[2] // 3),
-                            )
-                pygame.draw.rect(self.canvas, color, (sx, sy, size, size))
+                        continue  # leave as fog_unknown
+                    color = colors[int(self.world.map.terrain[row, col])]
+                    if not fog.visible[int(view), row, col]:
+                        color = np.array([
+                            max(2, color[0] // 3),
+                            max(2, color[1] // 3),
+                            max(2, color[2] // 3),
+                        ], dtype=np.uint8)
+                x1 = max(0, px)
+                y1 = max(0, py)
+                x2 = min(w, px + size)
+                y2 = min(h, py + size)
+                buf[x1:x2, y1:y2] = color
+
+        surface = pygame.surfarray.make_surface(buf)
+        self._terrain_cache = surface
+        self._terrain_cache_key = cam_key
+        self.canvas.blit(surface, BATTLE_RECT.topleft)
 
     def _draw_facilities_and_villages(self) -> None:
         assert self.world is not None and self.camera is not None
@@ -1418,7 +1493,7 @@ class GameApp:
             faction = int(self.world.units.faction[index])
             if view is not None and faction != int(view) and entity_id not in visible_enemy_ids:
                 continue
-            alpha = float(np.clip(self.accumulator / self.world.dt, 0, 1))
+            alpha = 1.0 if self.reduced_motion else float(np.clip(self.accumulator / self.world.dt, 0, 1))
             x = (
                 self.world.units.previous_x[index] * (1 - alpha) + self.world.units.x[index] * alpha
             ) / self.world.subpixels
