@@ -218,6 +218,8 @@ class GameApp:
         self.tick_timings: deque[float] = deque(maxlen=240)
         self._terrain_cache: pygame.Surface | None = None
         self._terrain_cache_key: tuple = ()
+        self._minimap_cache: pygame.Surface | None = None
+        self._minimap_cache_key: tuple = ()
         self.setup_seed = 20260907
         self.setup_symmetric = True
         self.setup_army_size = 500
@@ -251,6 +253,8 @@ class GameApp:
     def new_battle(self) -> None:
         self._terrain_cache = None
         self._terrain_cache_key = ()
+        self._minimap_cache = None
+        self._minimap_cache_key = ()
         battle_map = generate_map(seed=self.setup_seed, symmetric=self.setup_symmetric)
         self.world = World(
             battle_map=battle_map,
@@ -1699,28 +1703,36 @@ class GameApp:
     def _draw_minimap(self) -> None:
         assert self.world is not None and self.camera is not None
         rect = pygame.Rect(980, 548, 280, 152)
-        terrain_colors = np.asarray(
-            [
-                self.theme.terrain_plain,
-                self.theme.terrain_grass,
-                self.theme.terrain_forest,
-                self.theme.terrain_swamp,
-                self.theme.terrain_river,
-                self.theme.terrain_road,
-            ],
-            dtype=np.uint8,
-        )
-        pixels = terrain_colors[self.world.map.terrain]
         view = self.view_faction
         fog = self.world._perception
-        if view is not None and fog is not None:
-            explored = fog.explored[int(view)]
-            visible = fog.visible[int(view)]
-            pixels = pixels.copy()
-            pixels[~explored] = self.theme.fog_unknown
-            pixels[explored & ~visible] //= 3
-        surface = pygame.surfarray.make_surface(np.transpose(pixels, (1, 0, 2)))
-        self.canvas.blit(pygame.transform.scale(surface, rect.size), rect)
+
+        # Cache terrain surface - only rebuild when fog changes
+        fog_tick = self.world.tick // 10
+        cache_key = (int(view) if view is not None else -1, fog_tick)
+        if self._minimap_cache_key != cache_key or self._minimap_cache is None:
+            terrain_colors = np.asarray(
+                [
+                    self.theme.terrain_plain,
+                    self.theme.terrain_grass,
+                    self.theme.terrain_forest,
+                    self.theme.terrain_swamp,
+                    self.theme.terrain_river,
+                    self.theme.terrain_road,
+                ],
+                dtype=np.uint8,
+            )
+            pixels = terrain_colors[self.world.map.terrain]
+            if view is not None and fog is not None:
+                explored = fog.explored[int(view)]
+                visible = fog.visible[int(view)]
+                pixels = pixels.copy()
+                pixels[~explored] = self.theme.fog_unknown
+                pixels[explored & ~visible] //= 3
+            surface = pygame.surfarray.make_surface(np.transpose(pixels, (1, 0, 2)))
+            self._minimap_cache = pygame.transform.scale(surface, rect.size)
+            self._minimap_cache_key = cache_key
+
+        self.canvas.blit(self._minimap_cache, rect)
         observation = self.world.observation(view) if view is not None else None
         visible_ids = (
             {unit.entity_id for unit in observation.visible_enemies} if observation else set()
