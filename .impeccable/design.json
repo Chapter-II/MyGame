@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-09-07T00:00:00+08:00",
+  "title": "Design System: Commander Tactical Arena",
+  "extensions": {
+    "colorMeta": {
+      "night-command": {"role": "neutral", "displayName": "夜幕底色", "canonical": "oklch(0.100 0.000 0)", "tonalRamp": ["oklch(0.10 0 0)", "oklch(0.20 0 0)", "oklch(0.32 0 0)", "oklch(0.44 0 0)", "oklch(0.56 0 0)", "oklch(0.68 0 0)", "oklch(0.82 0 0)", "oklch(0.94 0 0)"]},
+      "cobalt-signal": {"role": "primary", "displayName": "钴蓝军令", "canonical": "oklch(0.620 0.160 260)", "tonalRamp": ["oklch(0.15 0.16 260)", "oklch(0.26 0.16 260)", "oklch(0.38 0.16 260)", "oklch(0.50 0.16 260)", "oklch(0.62 0.16 260)", "oklch(0.73 0.14 260)", "oklch(0.84 0.10 260)", "oklch(0.95 0.04 260)"]}
+    },
+    "typographyMeta": {
+      "body": {"displayName": "中文正文", "purpose": "界面、反馈与教程"}
+    },
+    "shadows": [{"name": "modal", "value": "0 4px 8px rgba(0,0,0,0.42)", "purpose": "仅用于阻断式模态窗口"}],
+    "motion": [{"name": "state", "value": "180ms cubic-bezier(0.22,1,0.36,1)", "purpose": "控件状态变化"}],
+    "breakpoints": [{"name": "logical", "value": "1280x720"}]
+  },
+  "components": [],
+  "narrative": {
+    "northStar": "午夜军令台",
+    "overview": "冷色、高对比且克制的桌面战术沙盘，所有视觉反馈服务于战场判断。",
+    "keyCharacteristics": ["战场优先", "命令可追溯", "非仅颜色编码", "平面停靠面板"],
+    "rules": [{"name": "Sparse Signal", "body": "钴蓝和琥珀只用于状态与操作。", "section": "colors"}],
+    "dos": ["Do 让战场始终占据最大连续区域。"],
+    "donts": ["Don't 用花哨装饰、玻璃拟态、过量粒子或无意义动效遮挡战场。"]
+  }
+}

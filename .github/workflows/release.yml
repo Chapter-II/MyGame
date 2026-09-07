@@ -1,0 +1,39 @@
+name: native-release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            artifact: CommanderTacticalArena-linux-x64
+          - os: windows-latest
+            artifact: CommanderTacticalArena-windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - run: pyinstaller --noconfirm CommanderTacticalArena.spec
+      - name: Linux packaged smoke test
+        if: runner.os == 'Linux'
+        run: ./dist/CommanderTacticalArena/CommanderTacticalArena --headless --ticks 10
+      - name: Windows packaged smoke test
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\dist\CommanderTacticalArena\CommanderTacticalArena.exe --headless --ticks 10
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/CommanderTacticalArena
+          if-no-files-found: error

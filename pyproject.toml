@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "commander-tactical-arena"
+version = "1.0.0"
+description = "A fog-of-war commander tactics game for Windows and Linux"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "httpx>=0.27,<1",
+  "msgpack>=1.1,<2",
+  "numpy>=2.0,<3",
+  "platformdirs>=4.3,<5",
+  "pydantic>=2.9,<3",
+  "pygame-ce>=2.5,<3",
+  "zstandard>=0.23,<1",
+]
+
+[project.optional-dependencies]
+voice = ["faster-whisper>=1.1,<2", "sounddevice>=0.5,<1"]
+dev = ["hypothesis>=6.115,<7", "mypy>=1.12,<2", "pyinstaller>=6.10,<7", "pytest>=8.3,<9", "ruff>=0.7,<1"]
+
+[project.scripts]
+mygame = "mygame.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+mygame = ["config/data/*.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["mygame"]
