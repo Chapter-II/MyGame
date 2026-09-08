@@ -74,6 +74,10 @@ class LocalStrategicAI:
         self._scout_targets: list[tuple[float, float]] = []
         self._last_known_enemy_pos: tuple[float, float] | None = None
         self._rng = random.Random(42)
+        self._commander_dead = False
+
+    def _has_commander(self, obs: ObservationSnapshotV1) -> bool:
+        return any(u.kind == "commander" for u in obs.own_units)
 
     def _strategy_ready(self, tick: int) -> bool:
         interval = int(self.config["strategy_interval_ticks"])
@@ -121,8 +125,9 @@ class LocalStrategicAI:
         # Recruit from villages
         commands.extend(self._order_recruit(obs))
 
-        # Convert recruits to useful classes
-        commands.extend(self._order_conversions(obs))
+        # Convert recruits to useful classes (skip if commander dead — rush units instead)
+        if not self._commander_dead:
+            commands.extend(self._order_conversions(obs))
 
         return commands
 
@@ -398,6 +403,12 @@ class LocalStrategicAI:
         aggression = float(self.config.get("aggression", 0.7))
         retreat_ratio = float(self.config.get("retreat_hp_ratio", 0.25))
 
+        # Detect commander death → desperation mode
+        if not self._commander_dead and not self._has_commander(obs):
+            self._commander_dead = True
+        if self._commander_dead:
+            aggression = min(1.0, aggression + 0.3)
+
         # Retreat damaged units
         commands.extend(self._retreat_damaged(obs, retreat_ratio))
 
@@ -408,8 +419,9 @@ class LocalStrategicAI:
         if bool(self.config.get("allow_inspire", False)):
             commands.extend(self._use_tactical(obs, aggression))
 
-        # Protect commander: guard assignment
-        commands.extend(self._protect_commander(obs))
+        # Protect commander: guard assignment (skip if commander is dead)
+        if not self._commander_dead:
+            commands.extend(self._protect_commander(obs))
 
         return commands
 

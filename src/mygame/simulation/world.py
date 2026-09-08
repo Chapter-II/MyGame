@@ -34,6 +34,19 @@ from mygame.protocols import (
     TacticalPayloadV1,
 )
 from mygame.simulation.navigation import FlowFieldCache
+from mygame.constants import (
+    ARRIVAL_DISTANCE, BRIDGE_RADIUS, BUILD_PROXIMITY, CHASE_DISTANCE,
+    COLLISION_CELL_SIZE, COLLISION_MAX_PUSH, COLLISION_MAX_SAMPLES,
+    COLLISION_OVERLAP_FACTOR, COLLISION_PUSH_FACTOR, COMBAT_CELL_SIZE,
+    COMPOSITION_ASSASSIN, COMPOSITION_ENGINEER, COMPOSITION_INFANTRY,
+    COMPOSITION_SCOUT, COMPOSITION_TOTAL, DEFAULT_DESTROYED_BOAT_DAMAGE,
+    DISEMBARK_BASE_RADIUS, DISEMBARK_GROWTH, FACILITY_ATTACK_BUFFER,
+    FACILITY_EJECT_RADIUS, FACILITY_INTERACTION_RADIUS, FORMATION_SPACING,
+    GOLDEN_ANGLE, GUARD_FOLLOW_OFFSET_X, GUARD_FOLLOW_OFFSET_Y,
+    GUARD_FOLLOW_RESQ, GUARD_INTERCEPT_DISTANCE, MAX_CROSSING_LOSS,
+    MAX_MELEE_ENGAGEMENTS, MAX_TARGET_SAMPLES, MELEE_RANGE_THRESHOLD,
+    RECRUIT_BASE_RADIUS, RECRUIT_GROWTH, RIVER_CROSSING_SAMPLES,
+)
 
 if TYPE_CHECKING:
     from mygame.perception.fog import FogOfWar
@@ -331,10 +344,10 @@ class World:
         army_size = max(10, min(1000, army_size))
         remaining = army_size - 5
         if composition is None:
-            infantry = round(remaining * 280 / 495)
-            scouts = round(remaining * 60 / 495)
-            engineers = round(remaining * 50 / 495)
-            assassins = round(remaining * 30 / 495)
+            infantry = round(remaining * COMPOSITION_INFANTRY / COMPOSITION_TOTAL)
+            scouts = round(remaining * COMPOSITION_SCOUT / COMPOSITION_TOTAL)
+            engineers = round(remaining * COMPOSITION_ENGINEER / COMPOSITION_TOTAL)
+            assassins = round(remaining * COMPOSITION_ASSASSIN / COMPOSITION_TOTAL)
             recruits = remaining - infantry - scouts - engineers - assassins
         else:
             allowed = {"infantry", "scout", "engineer", "assassin", "recruit"}
@@ -507,7 +520,7 @@ class World:
         x = float(np.clip(payload.target.x, 0, self.map.width))
         y = float(np.clip(payload.target.y, 0, self.map.height))
         crossing_loss = self._crossing_loss_estimate(indices, x, y)
-        offsets = self._formation_offsets(len(indices), 18.0)
+        offsets = self._formation_offsets(len(indices), FORMATION_SPACING)
         order = int(Order.ATTACK_MOVE if payload.kind == "attack_move" else Order.MOVE)
         for position, index in enumerate(indices):
             target_x = round((x + float(offsets[position, 0])) * self.subpixels)
@@ -548,7 +561,7 @@ class World:
             return 0.0
         start_x = float(np.mean(self.units.x[indices]) / self.subpixels)
         start_y = float(np.mean(self.units.y[indices]) / self.subpixels)
-        samples = 48
+        samples = RIVER_CROSSING_SAMPLES
         ratios = np.linspace(0, 1, samples)
         xs = start_x + (target_x - start_x) * ratios
         ys = start_y + (target_y - start_y) * ratios
@@ -561,7 +574,7 @@ class World:
             1.0,
             float(np.mean(self.units.speed[indices])) * self.balance.terrain_speed["river"],
         )
-        return min(999.0, river_distance / river_speed * self.balance.river_damage_per_second)
+        return min(MAX_CROSSING_LOSS, river_distance / river_speed * self.balance.river_damage_per_second)
 
     @staticmethod
     def _formation_offsets(count: int, spacing: float) -> np.ndarray:
@@ -653,7 +666,7 @@ class World:
         )
         self.units.last_intense_tick[eligible] = self.tick
         if payload.target is not None:
-            offsets = self._formation_offsets(len(eligible), 18.0)
+            offsets = self._formation_offsets(len(eligible), FORMATION_SPACING)
             self.units.target_x[eligible] = np.rint(
                 (payload.target.x + offsets[:, 0]) * self.subpixels
             ).astype(np.int32)
@@ -881,8 +894,8 @@ class World:
             )
         village.population -= amount
         for number in range(amount):
-            angle = number * 2.399963
-            radius = 24 + 5 * math.sqrt(number)
+            angle = number * GOLDEN_ANGLE
+            radius = RECRUIT_BASE_RADIUS + RECRUIT_GROWTH * math.sqrt(number)
             self.spawn_unit(
                 command.faction,
                 UnitKind.RECRUIT,
@@ -917,8 +930,8 @@ class World:
                     command, CommandStatus.REJECTED, "no_occupants", "所选单位不在该设施内。"
                 )
             for number, index in enumerate(leaving):
-                angle = number * 2.399963
-                radius = 30 + 4 * math.sqrt(number)
+                angle = number * GOLDEN_ANGLE
+                radius = DISEMBARK_BASE_RADIUS + DISEMBARK_GROWTH * math.sqrt(number)
                 self.units.x[index] = round(
                     np.clip(facility.x + math.cos(angle) * radius, 0, self.map.width)
                     * self.subpixels
@@ -944,7 +957,7 @@ class World:
         if len(nearby):
             dx = self.units.x[nearby] / self.subpixels - facility.x
             dy = self.units.y[nearby] / self.subpixels - facility.y
-            nearby = nearby[dx * dx + dy * dy <= 144**2]
+            nearby = nearby[dx * dx + dy * dy <= FACILITY_INTERACTION_RADIUS**2]
         capacity = int(self.balance.facilities[expected_kind].get("capacity", 20))
         occupied = int(np.sum(self.units.facility_id[: self.units.count] == facility.facility_id))
         entering = nearby[: max(0, capacity - occupied)]
@@ -1086,7 +1099,7 @@ class World:
             np.float64
         ) / self.subpixels
         distance = np.sqrt(dx * dx + dy * dy)
-        moving = distance > 1.0
+        moving = distance > ARRIVAL_DISTANCE
         arrived = movable[~moving]
         if len(arrived):
             self._advance_orders(arrived)
@@ -1147,7 +1160,7 @@ class World:
             if facility.complete and facility.kind == FacilityKind.BRIDGE:
                 bx = self.units.x[indices] / self.subpixels - facility.x
                 by = self.units.y[indices] / self.subpixels - facility.y
-                on_bridge = bx * bx + by * by < 52**2
+                on_bridge = bx * bx + by * by < BRIDGE_RADIUS**2
                 terrain_multiplier[on_bridge] = 0.95
         tactic = self.units.tactic_kind[indices]
         strength = self._tactic_strength(indices)
@@ -1190,7 +1203,7 @@ class World:
 
     def _resolve_collisions(self) -> None:
         active = self.units.active()
-        cell_size = 20.0
+        cell_size = COLLISION_CELL_SIZE
         buckets: dict[tuple[int, int], list[int]] = {}
         for index in active:
             x = int(self.units.x[index] / self.subpixels / cell_size)
@@ -1213,11 +1226,11 @@ class World:
                         second = candidates[start + (sample_start - start + offset) % available]
                         dx = float(self.units.x[second] - self.units.x[first]) / self.subpixels
                         dy = float(self.units.y[second] - self.units.y[first]) / self.subpixels
-                        minimum = float(self.units.radius[first] + self.units.radius[second]) * 0.78
+                        minimum = float(self.units.radius[first] + self.units.radius[second]) * COLLISION_OVERLAP_FACTOR
                         distance_sq = dx * dx + dy * dy
                         if 0 < distance_sq < minimum * minimum:
                             distance = math.sqrt(distance_sq)
-                            push = min((minimum - distance) * 0.35, 2.0) * self.subpixels
+                            push = min((minimum - distance) * COLLISION_PUSH_FACTOR, COLLISION_MAX_PUSH) * self.subpixels
                             px, py = dx / distance * push, dy / distance * push
                             self.units.x[first] -= round(px)
                             self.units.y[first] -= round(py)
@@ -1245,6 +1258,19 @@ class World:
                 )
 
     def _resolve_combat(self) -> None:
+        attackers = self._filter_attackers()
+        if len(attackers) == 0:
+            return
+        active = self.units.active()
+        buckets, cell = self._build_combat_buckets(active)
+        visible_targets, visible_facilities = self._compute_combat_visibility(attackers)
+        attacks, facility_attacks = self._select_targets(
+            attackers, buckets, cell, visible_targets, visible_facilities
+        )
+        self._apply_facility_damage(facility_attacks)
+        self._apply_unit_damage(attacks)
+
+    def _filter_attackers(self) -> np.ndarray:
         active = self.units.active()
         boat_ids = {
             facility.facility_id
@@ -1266,10 +1292,15 @@ class World:
                     continue
                 dx = self.units.x[attackers] / self.subpixels - facility.x
                 dy = self.units.y[attackers] / self.subpixels - facility.y
-                protected |= dx * dx + dy * dy < 52**2
+                protected |= dx * dx + dy * dy < BRIDGE_RADIUS**2
             attackers = attackers[~crossing | protected]
+        return attackers
+
+    def _build_combat_buckets(
+        self, active: np.ndarray
+    ) -> tuple[list[dict[tuple[int, int], list[int]]], float]:
         buckets: list[dict[tuple[int, int], list[int]]] = [{}, {}]
-        cell = 64.0
+        cell = COMBAT_CELL_SIZE
         for index in active:
             if self.units.kind[index] == int(UnitKind.ASSASSIN) and not self.units.exposed[index]:
                 continue
@@ -1278,9 +1309,11 @@ class World:
                 int(self.units.y[index] / self.subpixels / cell),
             )
             buckets[int(self.units.faction[index])].setdefault(key, []).append(int(index))
-        attacks: list[tuple[int, int, float]] = []
-        facility_attacks: list[tuple[int, int, float]] = []
-        engagement_counts: dict[int, int] = {}
+        return buckets, cell
+
+    def _compute_combat_visibility(
+        self, attackers: np.ndarray
+    ) -> tuple[list[set[int]], list[set[int]]]:
         visible_targets: list[set[int]] = [set(), set()]
         if self._perception is not None and np.any(self.units.focus_target[attackers] >= 0):
             for faction in (Faction.PLAYER, Faction.ENEMY):
@@ -1295,126 +1328,177 @@ class World:
                     for item in self.observation(faction).known_facilities
                     if int(item["faction"]) != int(faction)
                 }
+        return visible_targets, visible_facilities
+
+    def _select_targets(
+        self,
+        attackers: np.ndarray,
+        buckets: list[dict[tuple[int, int], list[int]]],
+        cell: float,
+        visible_targets: list[set[int]],
+        visible_facilities: list[set[int]],
+    ) -> tuple[list[tuple[int, int, float]], list[tuple[int, int, float]]]:
+        attacks: list[tuple[int, int, float]] = []
+        facility_attacks: list[tuple[int, int, float]] = []
+        engagement_counts: dict[int, int] = {}
         for attacker in attackers:
             if self.units.cooldown[attacker] > 0 or self.units.order[attacker] == int(Order.BUILD):
                 continue
             focus_facility_id = int(self.units.focus_facility[attacker])
             if focus_facility_id >= 0:
-                focused_facility = next(
-                    (
-                        item
-                        for item in self.facilities
-                        if item.facility_id == focus_facility_id and not item.destroyed
-                    ),
-                    None,
+                self._try_attack_facility(
+                    attacker, focus_facility_id, visible_facilities, facility_attacks
                 )
-                if (
-                    focused_facility is None
-                    or focus_facility_id
-                    not in visible_facilities[int(self.units.faction[attacker])]
-                ):
-                    self.units.focus_facility[attacker] = -1
-                else:
-                    dx = focused_facility.x - self.units.x[attacker] / self.subpixels
-                    dy = focused_facility.y - self.units.y[attacker] / self.subpixels
-                    distance = math.hypot(dx, dy)
-                    if distance <= float(self.units.attack_range[attacker]) + 12:
-                        facility_attacks.append(
-                            (
-                                int(attacker),
-                                focused_facility.facility_id,
-                                float(self.units.damage[attacker]),
-                            )
-                        )
-                        self.units.cooldown[attacker] = self.units.attack_interval[attacker]
-                    else:
-                        self.units.target_x[attacker] = round(focused_facility.x * self.subpixels)
-                        self.units.target_y[attacker] = round(focused_facility.y * self.subpixels)
-                    continue
-            key = (
-                int(self.units.x[attacker] / self.subpixels / cell),
-                int(self.units.y[attacker] / self.subpixels / cell),
+                continue
+            best_target = self._find_nearest_target(
+                attacker, buckets, cell, visible_targets
             )
-            best_target: int | None = None
-            best_distance = float("inf")
-            focus_id = int(self.units.focus_target[attacker])
-            if focus_id >= 0:
-                focused = self.units.index_of(focus_id)
-                if (
-                    focused is not None
-                    and self.units.alive[focused]
-                    and focus_id in visible_targets[int(self.units.faction[attacker])]
-                ):
-                    best_target = focused
-                else:
-                    self.units.focus_target[attacker] = -1
-            if best_target is None:
-                for ox in (-1, 0, 1):
-                    for oy in (-1, 0, 1):
-                        opposing = buckets[1 - int(self.units.faction[attacker])]
-                        candidates = opposing.get((key[0] + ox, key[1] + oy), ())
-                        sample_count = min(4, len(candidates))
-                        start = (
-                            int(self.units.entity_id[attacker]) % len(candidates)
-                            if len(candidates) > sample_count
-                            else 0
-                        )
-                        for offset in range(sample_count):
-                            target = candidates[(start + offset) % len(candidates)]
-                            dx = (
-                                float(self.units.x[target] - self.units.x[attacker])
-                                / self.subpixels
-                            )
-                            dy = (
-                                float(self.units.y[target] - self.units.y[attacker])
-                                / self.subpixels
-                            )
-                            distance_sq = dx * dx + dy * dy
-                            if distance_sq < best_distance:
-                                best_target, best_distance = target, distance_sq
             if best_target is None:
                 continue
             best_target = self._guard_intercept(best_target)
-            dx = float(self.units.x[best_target] - self.units.x[attacker]) / self.subpixels
-            dy = float(self.units.y[best_target] - self.units.y[attacker]) / self.subpixels
-            distance = math.sqrt(dx * dx + dy * dy)
-            attack_range = float(self.units.attack_range[attacker] + self.units.radius[best_target])
-            if distance <= attack_range:
-                melee = self.units.attack_range[attacker] <= 30
-                if melee and engagement_counts.get(best_target, 0) >= 6:
-                    continue
-                if melee:
-                    engagement_counts[best_target] = engagement_counts.get(best_target, 0) + 1
-                if self.units.kind[attacker] == int(UnitKind.ASSASSIN):
-                    self.units.exposed[attacker] = True
-                attack_damage = float(self.units.damage[attacker])
-                charge_damage_threshold = round(
+            self._resolve_attack(attacker, best_target, engagement_counts, attacks)
+        return attacks, facility_attacks
+
+    def _try_attack_facility(
+        self,
+        attacker: int,
+        focus_facility_id: int,
+        visible_facilities: list[set[int]],
+        facility_attacks: list[tuple[int, int, float]],
+    ) -> None:
+        focused_facility = next(
+            (
+                item
+                for item in self.facilities
+                if item.facility_id == focus_facility_id and not item.destroyed
+            ),
+            None,
+        )
+        if (
+            focused_facility is None
+            or focus_facility_id
+            not in visible_facilities[int(self.units.faction[attacker])]
+        ):
+            self.units.focus_facility[attacker] = -1
+        else:
+            dx = focused_facility.x - self.units.x[attacker] / self.subpixels
+            dy = focused_facility.y - self.units.y[attacker] / self.subpixels
+            distance = math.hypot(dx, dy)
+            if distance <= float(self.units.attack_range[attacker]) + FACILITY_ATTACK_BUFFER:
+                facility_attacks.append(
                     (
-                        self.balance.tactics["charge_duration"]
-                        - self.balance.tactics["charge_damage_duration"]
+                        int(attacker),
+                        focused_facility.facility_id,
+                        float(self.units.damage[attacker]),
                     )
-                    * self.balance.world.simulation_hz
                 )
-                if (
-                    self.units.tactic_kind[attacker] == 2
-                    and self.units.tactic_ticks[attacker] > charge_damage_threshold
-                ):
-                    attack_damage *= self.balance.tactics["charge_damage_multiplier"]
-                attacks.append((int(attacker), int(best_target), attack_damage))
                 self.units.cooldown[attacker] = self.units.attack_interval[attacker]
-                self.units.last_intense_tick[attacker] = self.tick
-            elif self.units.order[attacker] == int(Order.ATTACK_MOVE) and distance < 180:
-                self.units.target_x[attacker] = self.units.x[best_target]
-                self.units.target_y[attacker] = self.units.y[best_target]
-        if facility_attacks:
-            facility_damage: dict[int, float] = {}
-            for _attacker, facility_id, amount in facility_attacks:
-                facility_damage[facility_id] = facility_damage.get(facility_id, 0.0) + amount
-            for facility_id, amount in facility_damage.items():
-                facility = next(item for item in self.facilities if item.facility_id == facility_id)
-                facility.hp -= amount
-                if facility.hp <= 0:
-                    self._destroy_facility(facility)
+            else:
+                self.units.target_x[attacker] = round(focused_facility.x * self.subpixels)
+                self.units.target_y[attacker] = round(focused_facility.y * self.subpixels)
+
+    def _find_nearest_target(
+        self,
+        attacker: int,
+        buckets: list[dict[tuple[int, int], list[int]]],
+        cell: float,
+        visible_targets: list[set[int]],
+    ) -> int | None:
+        key = (
+            int(self.units.x[attacker] / self.subpixels / cell),
+            int(self.units.y[attacker] / self.subpixels / cell),
+        )
+        focus_id = int(self.units.focus_target[attacker])
+        if focus_id >= 0:
+            focused = self.units.index_of(focus_id)
+            if (
+                focused is not None
+                and self.units.alive[focused]
+                and focus_id in visible_targets[int(self.units.faction[attacker])]
+            ):
+                return focused
+            self.units.focus_target[attacker] = -1
+        best_target: int | None = None
+        best_distance = float("inf")
+        for ox in (-1, 0, 1):
+            for oy in (-1, 0, 1):
+                opposing = buckets[1 - int(self.units.faction[attacker])]
+                candidates = opposing.get((key[0] + ox, key[1] + oy), ())
+                sample_count = min(MAX_TARGET_SAMPLES, len(candidates))
+                start = (
+                    int(self.units.entity_id[attacker]) % len(candidates)
+                    if len(candidates) > sample_count
+                    else 0
+                )
+                for offset in range(sample_count):
+                    target = candidates[(start + offset) % len(candidates)]
+                    dx = (
+                        float(self.units.x[target] - self.units.x[attacker])
+                        / self.subpixels
+                    )
+                    dy = (
+                        float(self.units.y[target] - self.units.y[attacker])
+                        / self.subpixels
+                    )
+                    distance_sq = dx * dx + dy * dy
+                    if distance_sq < best_distance:
+                        best_target, best_distance = target, distance_sq
+        return best_target
+
+    def _resolve_attack(
+        self,
+        attacker: int,
+        target: int,
+        engagement_counts: dict[int, int],
+        attacks: list[tuple[int, int, float]],
+    ) -> None:
+        dx = float(self.units.x[target] - self.units.x[attacker]) / self.subpixels
+        dy = float(self.units.y[target] - self.units.y[attacker]) / self.subpixels
+        distance = math.sqrt(dx * dx + dy * dy)
+        attack_range = float(self.units.attack_range[attacker] + self.units.radius[target])
+        if distance <= attack_range:
+            melee = self.units.attack_range[attacker] <= MELEE_RANGE_THRESHOLD
+            if melee and engagement_counts.get(target, 0) >= MAX_MELEE_ENGAGEMENTS:
+                return
+            if melee:
+                engagement_counts[target] = engagement_counts.get(target, 0) + 1
+            if self.units.kind[attacker] == int(UnitKind.ASSASSIN):
+                self.units.exposed[attacker] = True
+            attack_damage = float(self.units.damage[attacker])
+            charge_damage_threshold = round(
+                (
+                    self.balance.tactics["charge_duration"]
+                    - self.balance.tactics["charge_damage_duration"]
+                )
+                * self.balance.world.simulation_hz
+            )
+            if (
+                self.units.tactic_kind[attacker] == 2
+                and self.units.tactic_ticks[attacker] > charge_damage_threshold
+            ):
+                attack_damage *= self.balance.tactics["charge_damage_multiplier"]
+            attacks.append((int(attacker), int(target), attack_damage))
+            self.units.cooldown[attacker] = self.units.attack_interval[attacker]
+            self.units.last_intense_tick[attacker] = self.tick
+        elif self.units.order[attacker] == int(Order.ATTACK_MOVE) and distance < CHASE_DISTANCE:
+            self.units.target_x[attacker] = self.units.x[target]
+            self.units.target_y[attacker] = self.units.y[target]
+
+    def _apply_facility_damage(
+        self, facility_attacks: list[tuple[int, int, float]]
+    ) -> None:
+        if not facility_attacks:
+            return
+        facility_damage: dict[int, float] = {}
+        for _attacker, facility_id, amount in facility_attacks:
+            facility_damage[facility_id] = facility_damage.get(facility_id, 0.0) + amount
+        for facility_id, amount in facility_damage.items():
+            facility = next(item for item in self.facilities if item.facility_id == facility_id)
+            facility.hp -= amount
+            if facility.hp <= 0:
+                self._destroy_facility(facility)
+
+    def _apply_unit_damage(self, attacks: list[tuple[int, int, float]]) -> None:
         if not attacks:
             return
         damage_totals = np.zeros(self.units.count, dtype=np.float32)
@@ -1456,7 +1540,7 @@ class World:
             return target
         dx = (self.units.x[guards] - self.units.x[target]) / self.subpixels
         dy = (self.units.y[guards] - self.units.y[target]) / self.subpixels
-        nearby = guards[dx * dx + dy * dy <= 160**2]
+        nearby = guards[dx * dx + dy * dy <= GUARD_INTERCEPT_DISTANCE**2]
         return int(nearby[0]) if len(nearby) else target
 
     def _update_engineering(self) -> None:
@@ -1474,7 +1558,7 @@ class World:
                     continue
                 dx = self.units.x[index] / self.subpixels - facility.x
                 dy = self.units.y[index] / self.subpixels - facility.y
-                if dx * dx + dy * dy <= 48**2:
+                if dx * dx + dy * dy <= BUILD_PROXIMITY**2:
                     builders.append(index)
             if len(builders) < facility.minimum_engineers:
                 continue
@@ -1513,19 +1597,19 @@ class World:
             self.units.facility_id[: self.units.count] == facility.facility_id
         )
         damage = (
-            float(self.balance.facilities["boat"].get("destroyed_damage", 40.0))
+            float(self.balance.facilities["boat"].get("destroyed_damage", DEFAULT_DESTROYED_BOAT_DAMAGE))
             if facility.kind == FacilityKind.BOAT
             else 0.0
         )
         for number, index in enumerate(occupants):
             if damage:
                 self.units.hp[index] -= damage
-            angle = number * 2.399963
+            angle = number * GOLDEN_ANGLE
             self.units.x[index] = round(
-                np.clip(facility.x + math.cos(angle) * 34, 0, self.map.width) * self.subpixels
+                np.clip(facility.x + math.cos(angle) * FACILITY_EJECT_RADIUS, 0, self.map.width) * self.subpixels
             )
             self.units.y[index] = round(
-                np.clip(facility.y + math.sin(angle) * 34, 0, self.map.height) * self.subpixels
+                np.clip(facility.y + math.sin(angle) * FACILITY_EJECT_RADIUS, 0, self.map.height) * self.subpixels
             )
             self.units.facility_id[index] = -1
             self.units.order[index] = int(Order.IDLE)
@@ -1587,7 +1671,7 @@ class World:
                 continue
             dx = self.units.x[in_river] / self.subpixels - facility.x
             dy = self.units.y[in_river] / self.subpixels - facility.y
-            protected |= dx * dx + dy * dy < 52**2
+            protected |= dx * dx + dy * dy < BRIDGE_RADIUS**2
         affected = in_river[~protected]
         self.units.hp[affected] -= self.balance.river_damage_per_second * self.dt
         self.units.last_intense_tick[affected] = self.tick

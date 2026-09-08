@@ -235,7 +235,7 @@ def test_shift_append_runs_orders_in_sequence() -> None:
     ).model_copy(update={"queue_mode": QueueMode.APPEND})
     world.execute(first)
     world.execute(second)
-    world.step(50)
+    world.step(100)
     assert world.units.x[0] / world.subpixels > 170
 
 

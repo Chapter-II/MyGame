@@ -324,9 +324,9 @@ class RuleCommandParser:
             )
         elif any(
             word in cleaned
-            for word in ("前往", "移动", "出发", "攻击", "进攻", "搜索", "侦察", "守住")
+            for word in ("前往", "移动", "出发", "攻击", "进攻", "搜索", "侦察", "守住", "前进", "推进", "进军")
         ):
-            attack = any(word in cleaned for word in ("攻击", "进攻", "搜索", "侦察"))
+            attack = any(word in cleaned for word in ("攻击", "进攻", "搜索", "侦察", "进军"))
             envelope = CommandEnvelopeV1(
                 command_id=command_id,
                 faction=observation.faction,
@@ -608,9 +608,10 @@ _UNIT_TEMPLATES: dict[str, list[str]] = {
 }
 
 _ACTION_TEMPLATES: dict[str, list[str]] = {
-    "前往 移动 出发 去": [
+    "前往 移动 出发 去 前进 推进 进军": [
         "{group}前往{direction}",
         "{group}前往{village}",
+        "{group}前进",
     ],
     "攻击 进攻 打": [
         "{group}攻击{enemy_cmd}",

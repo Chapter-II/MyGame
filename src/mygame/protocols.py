@@ -34,8 +34,6 @@ class CommandStatus(StrEnum):
     ACCEPTED = "accepted"
     REJECTED = "rejected"
     EXPIRED = "expired"
-    CANCELLED = "cancelled"
-    COMPLETED = "completed"
 
 
 class PositionV1(ProtocolModel):

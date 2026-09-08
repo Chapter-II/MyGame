@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import os
 import sys
@@ -41,7 +42,9 @@ from mygame.protocols import (
 )
 from mygame.rendering import Theme
 from mygame.simulation import GameOutcome, UnitKind, World
+from mygame.constants import ENEMY_CLICK_RADIUS_SQ, UNIT_CLICK_RADIUS_SQ
 
+logger = logging.getLogger(__name__)
 LOGICAL_SIZE = (1280, 720)
 BATTLE_RECT = pygame.Rect(0, 40, 960, 548)
 
@@ -111,7 +114,7 @@ class SoundBook:
                 try:
                     self.sounds[name] = pygame.mixer.Sound(audio_root / f"{name}.wav")
                 except pygame.error:
-                    pass
+                    logger.debug("音效加载失败: %s", name)
             break
         self.set_volume(volume)
 
@@ -162,14 +165,19 @@ class GameApp:
                 import ctypes
                 ctypes.windll.shcore.SetProcessDpiAwareness(1)
             except Exception:
-                pass
+                logger.debug("DPI 感知设置失败", exc_info=True)
         pygame.init()
         pygame.font.init()
         self.theme = Theme()
         self.settings_manager = SettingsManager()
         self.settings = self.settings_manager.load()
-        flags = pygame.FULLSCREEN if self.settings.fullscreen else pygame.RESIZABLE
-        self.screen = pygame.display.set_mode(LOGICAL_SIZE, flags)
+        base_flags = pygame.FULLSCREEN if self.settings.fullscreen else pygame.RESIZABLE
+        try:
+            self.screen = pygame.display.set_mode(LOGICAL_SIZE, base_flags | pygame.SCALED)
+            self._scaled_mode = True
+        except Exception:
+            self.screen = pygame.display.set_mode(LOGICAL_SIZE, base_flags)
+            self._scaled_mode = False
         pygame.display.set_caption("指挥官战术对抗")
         self.canvas = pygame.Surface(LOGICAL_SIZE)
         self.clock = pygame.time.Clock()
@@ -263,6 +271,10 @@ class GameApp:
             army_composition=self.setup_composition,
         )
         self.world.groups[int(Faction.PLAYER)].update(self.settings.group_names)
+        self.rule_parser.world_width = self.world.map.width
+        self.rule_parser.world_height = self.world.map.height
+        self.rule_parser.suggester.world_width = self.world.map.width
+        self.rule_parser.suggester.world_height = self.world.map.height
         self.camera = Camera(self.world)
         self.ai = LocalStrategicAI(
             self.world.map.width,
@@ -285,6 +297,10 @@ class GameApp:
     def load_battle(self) -> None:
         try:
             self.world = self.save_manager.load()
+            self.rule_parser.world_width = self.world.map.width
+            self.rule_parser.world_height = self.world.map.height
+            self.rule_parser.suggester.world_width = self.world.map.width
+            self.rule_parser.suggester.world_height = self.world.map.height
             self.camera = Camera(self.world)
             self.ai = LocalStrategicAI(
                 self.world.map.width,
@@ -326,7 +342,7 @@ class GameApp:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
-            elif event.type == pygame.VIDEORESIZE and not self.fullscreen:
+            elif event.type == pygame.VIDEORESIZE and not self.fullscreen and not self._scaled_mode:
                 self.screen = pygame.display.set_mode(event.size, pygame.RESIZABLE)
             elif event.type == pygame.WINDOWFOCUSLOST and self.recording:
                 self.recording = False
@@ -364,7 +380,7 @@ class GameApp:
                     try:
                         self.menu_focus = enabled_buttons.index(button)
                     except ValueError:
-                        pass
+                        logger.debug("按钮焦点同步失败")
                     break
 
     def _battle_event(self, event: pygame.event.Event) -> None:
@@ -375,6 +391,7 @@ class GameApp:
                 self.command_input += event.text
             self.composition = ""
             self._update_ime_rect()
+            self._refresh_suggestions()
             return
         if event.type == pygame.TEXTEDITING and self.typing:
             self.composition = event.text
@@ -420,12 +437,30 @@ class GameApp:
                 if event.key == pygame.K_ESCAPE:
                     self.typing = False
                     self.composition = ""
+                    self.suggestions = []
                     if hasattr(pygame.key, "stop_text_input"):
                         pygame.key.stop_text_input()
                 elif event.key == pygame.K_RETURN:
-                    self._submit_text()
+                    if self.suggestions and self.selected_suggestion < len(self.suggestions):
+                        self.command_input = self.suggestions[self.selected_suggestion]
+                        self.suggestions = []
+                        self.selected_suggestion = 0
+                    else:
+                        self._submit_text()
+                elif event.key == pygame.K_TAB:
+                    if self.suggestions and self.selected_suggestion < len(self.suggestions):
+                        self.command_input = self.suggestions[self.selected_suggestion]
+                        self.suggestions = []
+                        self.selected_suggestion = 0
+                elif event.key == pygame.K_UP:
+                    if self.suggestions:
+                        self.selected_suggestion = max(0, self.selected_suggestion - 1)
+                elif event.key == pygame.K_DOWN:
+                    if self.suggestions:
+                        self.selected_suggestion = min(len(self.suggestions) - 1, self.selected_suggestion + 1)
                 elif event.key == pygame.K_BACKSPACE:
                     self.command_input = self.command_input[:-1]
+                    self._refresh_suggestions()
                 return
             if (
                 self.scene == "battle"
@@ -445,6 +480,7 @@ class GameApp:
                 self.typing = True
                 self.command_input = ""
                 self.composition = ""
+                self._refresh_suggestions()
                 if hasattr(pygame.key, "start_text_input"):
                     self._update_ime_rect()
                     pygame.key.start_text_input()
@@ -571,14 +607,31 @@ class GameApp:
         self.typing = False
         self.command_input = ""
         self.composition = ""
+        self.suggestions = []
         if hasattr(pygame.key, "stop_text_input"):
             pygame.key.stop_text_input()
+        # Split compound commands on conjunctions
+        import re
+        segments = re.split(r"\s*(?:然后|接着|并且|同时|再|并)\s*", text)
+        segments = [s.strip() for s in segments if s.strip()]
+        if not segments:
+            return
+        executed = 0
+        for segment in segments:
+            if not self._execute_single_command(segment):
+                break
+            executed += 1
+        if executed > 1:
+            self._message(f"已执行 {executed} 条指令。", self.theme.success)
+
+    def _execute_single_command(self, text: str) -> bool:
+        """Parse and execute one command segment. Returns False if rejected."""
         parsed = self.rule_parser.parse(text, self.world.observation(Faction.PLAYER))
         if parsed.status == CommandStatus.PENDING and parsed.candidates:
             if len(parsed.candidates) > 1:
                 self.ambiguity_candidates = list(parsed.candidates[:3])
                 self._message(parsed.message_zh, self.theme.warning)
-                return
+                return False
             command = parsed.candidates[0]
             result = self.world.execute(command)
             self._remember_group_name(command, result)
@@ -588,15 +641,26 @@ class GameApp:
                 result.message_zh,
                 self.theme.success if result.status == CommandStatus.ACCEPTED else self.theme.enemy,
             )
-        elif self.online_enabled and self.deepseek.available:
+            return result.status == CommandStatus.ACCEPTED
+        # Try online fallback only for single-segment input
+        if self.online_enabled and self.deepseek.available:
             self.pending_retry_text = text
             self.provider_retry_count = 0
             self.pending_text = self.executor.submit(
                 self.deepseek.parse, text, self.world.observation(Faction.PLAYER)
             )
             self._message("离线规则未识别，正在请求 DeepSeek……", self.theme.warning)
-        else:
-            self._message(parsed.message_zh, self.theme.enemy)
+            return False
+        self._message(parsed.message_zh, self.theme.enemy)
+        return False
+
+    def _refresh_suggestions(self) -> None:
+        if self.world is None:
+            self.suggestions = []
+            return
+        obs = self.world.observation(Faction.PLAYER)
+        self.suggestions = self.rule_parser.suggester.suggest(self.command_input, obs)
+        self.selected_suggestion = 0
 
     def _update_ime_rect(self) -> None:
         if not hasattr(pygame.key, "set_text_input_rect"):
@@ -683,7 +747,7 @@ class GameApp:
                         self.camera.world_to_screen(unit.x, unit.y), point, strict=True
                     )
                 )
-                <= 14**2
+                <= ENEMY_CLICK_RADIUS_SQ
             ),
             None,
         )
@@ -738,6 +802,16 @@ class GameApp:
         result = self.world.execute(command)
         if result.status == CommandStatus.ACCEPTED:
             self.sounds.play("command")
+            # River crossing warning
+            indices = [self.world.units.index_of(eid) for eid in ids]
+            valid = [i for i in indices if i is not None]
+            if valid:
+                loss = self.world._crossing_loss_estimate(np.array(valid), x, y)
+                if loss > 10:
+                    self._message(
+                        f"⚠ 途经河流，预计 HP 损失约 {loss:.0f}",
+                        self.theme.warning,
+                    )
         self._message(
             result.message_zh,
             self.theme.success if result.status == CommandStatus.ACCEPTED else self.theme.enemy,
@@ -759,7 +833,7 @@ class GameApp:
                 self.world.units.x[index] / self.world.subpixels,
                 self.world.units.y[index] / self.world.subpixels,
             )
-            if (click and (sx - end[0]) ** 2 + (sy - end[1]) ** 2 <= 12**2) or (
+            if (click and (sx - end[0]) ** 2 + (sy - end[1]) ** 2 <= UNIT_CLICK_RADIUS_SQ) or (
                 not click and rect.collidepoint(sx, sy)
             ):
                 chosen.append(
@@ -818,7 +892,7 @@ class GameApp:
                 try:
                     self.save_manager.save_replay(self.recorder.finish(self.world))
                 except OSError:
-                    pass
+                    logger.warning("回放保存失败", exc_info=True)
 
     def _poll_workers(self) -> None:
         if self.world is None:
@@ -907,6 +981,7 @@ class GameApp:
             self._save_settings()
 
     def _draw(self) -> None:
+        self._mouse_pos = self._logical_mouse(pygame.mouse.get_pos())
         self.canvas.fill(self.theme.background)
         self.buttons = []
         if self.scene == "menu":
@@ -946,7 +1021,7 @@ class GameApp:
             ("新手教程", self._open_tutorial, True),
             ("退出", lambda: setattr(self, "running", False), True),
         ]
-        mouse = self._logical_mouse(pygame.mouse.get_pos())
+        mouse = self._mouse_pos
         for index, (label, action, enabled) in enumerate(labels):
             rect = pygame.Rect(98, 220 + index * 52, 300, 40)
             hovered = rect.collidepoint(mouse) and enabled
@@ -1009,7 +1084,7 @@ class GameApp:
                 self._cycle_difficulty,
             ),
         ]
-        mouse = self._logical_mouse(pygame.mouse.get_pos())
+        mouse = self._mouse_pos
         for index, (label, value, action) in enumerate(rows):
             y = 220 + index * 72
             self._blit_text(label, 138, y + 18, 15, self.theme.muted, center_y=True)
@@ -1151,7 +1226,7 @@ class GameApp:
                 self._toggle_online,
             ),
         ]
-        mouse = self._logical_mouse(pygame.mouse.get_pos())
+        mouse = self._mouse_pos
         for index, (label, value, action) in enumerate(rows):
             y = 226 + index * 66
             self._blit_text(label, 138, y + 18, 15, self.theme.muted, center_y=True)
@@ -1275,8 +1350,11 @@ class GameApp:
 
     def _toggle_fullscreen(self) -> None:
         self.fullscreen = not self.fullscreen
-        flags = pygame.FULLSCREEN if self.fullscreen else pygame.RESIZABLE
-        self.screen = pygame.display.set_mode(LOGICAL_SIZE, flags)
+        base_flags = pygame.FULLSCREEN if self.fullscreen else pygame.RESIZABLE
+        if self._scaled_mode:
+            self.screen = pygame.display.set_mode(LOGICAL_SIZE, base_flags | pygame.SCALED)
+        else:
+            self.screen = pygame.display.set_mode(LOGICAL_SIZE, base_flags)
         self._save_settings()
 
     def _save_settings(self) -> None:
@@ -1290,7 +1368,7 @@ class GameApp:
         try:
             self.settings_manager.save(self.settings)
         except OSError:
-            pass
+            logger.warning("设置保存失败", exc_info=True)
 
     def _draw_action_button(
         self, rect: pygame.Rect, label: str, action: Callable[[], None], primary: bool = False
@@ -1299,7 +1377,7 @@ class GameApp:
         is_focused = 0 <= self.menu_focus < len(enabled_buttons) and len(enabled_buttons) > 0
         focused_rect = enabled_buttons[self.menu_focus].rect if is_focused else None
         keyboard_focused = focused_rect == rect if focused_rect else False
-        hovered = rect.collidepoint(self._logical_mouse(pygame.mouse.get_pos()))
+        hovered = rect.collidepoint(self._mouse_pos)
         color = (
             self.theme.primary_hover
             if (hovered or keyboard_focused) and primary
@@ -1326,7 +1404,7 @@ class GameApp:
         self._draw_units()
         self._draw_hud()
         if self.drag_start and pygame.mouse.get_pressed()[0]:
-            end = self._logical_mouse(pygame.mouse.get_pos())
+            end = self._mouse_pos
             rect = pygame.Rect(
                 min(self.drag_start[0], end[0]),
                 min(self.drag_start[1], end[1]),
@@ -1693,7 +1771,21 @@ class GameApp:
             self._blit_text(
                 self.command_input + self.composition + "│", box.x + 12, box.centery, 15, self.theme.ink, center_y=True
             )
-            self._blit_text("Enter 执行 · Esc 取消", 340, 674, 12, self.theme.muted)
+            hint = "Tab 补全 · ↑↓ 选择 · Enter 执行 · Esc 取消"
+            self._blit_text(hint, 340, 674, 12, self.theme.muted)
+            # Render suggestions dropdown (above input box)
+            if self.suggestions:
+                sug_h = len(self.suggestions) * 26 + 4
+                sug_box = pygame.Rect(box.x, box.y - sug_h - 2, box.width, sug_h)
+                pygame.draw.rect(self.canvas, self.theme.background, sug_box, border_radius=4)
+                pygame.draw.rect(self.canvas, self.theme.muted, sug_box, 1, border_radius=4)
+                for i, text in enumerate(self.suggestions):
+                    is_sel = i == self.selected_suggestion
+                    if is_sel:
+                        sel_rect = pygame.Rect(sug_box.x + 2, sug_box.y + 2 + i * 26, sug_box.width - 4, 24)
+                        pygame.draw.rect(self.canvas, self.theme.primary, sel_rect, border_radius=3)
+                    color = self.theme.background if is_sel else self.theme.ink
+                    self._blit_text(text, sug_box.x + 10, sug_box.y + 4 + i * 26, 14, color)
         else:
             self._blit_text("Enter 输入文字军令 · 按住 V 语音下令", 340, 638, 15, self.theme.ink)
             self._blit_text(
@@ -2009,7 +2101,7 @@ class GameApp:
 
         # Buttons
         y = max(y + 20, 470)
-        mouse = self._logical_mouse(pygame.mouse.get_pos())
+        mouse = self._mouse_pos
         options = [
             ("再来一局", self.new_battle),
             ("返回主菜单", lambda: setattr(self, "scene", "menu")),
@@ -2069,14 +2161,20 @@ class GameApp:
         return result
 
     def _viewport(self) -> pygame.Rect:
+        if self._scaled_mode:
+            return pygame.Rect(0, 0, *LOGICAL_SIZE)
         sw, sh = self.screen.get_size()
         scale = min(sw / LOGICAL_SIZE[0], sh / LOGICAL_SIZE[1])
         width, height = round(LOGICAL_SIZE[0] * scale), round(LOGICAL_SIZE[1] * scale)
         return pygame.Rect((sw - width) // 2, (sh - height) // 2, width, height)
 
     def _present(self) -> None:
-        viewport = self._viewport()
-        self.screen.fill(self.theme.background)
-        scaled = pygame.transform.smoothscale(self.canvas, viewport.size)
-        self.screen.blit(scaled, viewport)
-        pygame.display.flip()
+        if self._scaled_mode:
+            self.screen.blit(self.canvas, (0, 0))
+            pygame.display.flip()
+        else:
+            viewport = self._viewport()
+            self.screen.fill(self.theme.background)
+            scaled = pygame.transform.smoothscale(self.canvas, viewport.size)
+            self.screen.blit(scaled, viewport)
+            pygame.display.flip()
