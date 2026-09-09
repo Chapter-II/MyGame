@@ -1,5 +1,9 @@
 import uuid
 
+import numpy as np
+
+from mygame.constants import BRIDGE_DECK_HALF_WIDTH
+from mygame.maps import Terrain
 from mygame.protocols import (
     AttackFacilityPayloadV1,
     BuildPayloadV1,
@@ -38,6 +42,28 @@ def test_default_armies_have_real_entities_and_required_roles() -> None:
         assert sum(world.units.kind[active] == int(UnitKind.GUARD)) == 4
 
 
+def test_default_army_roles_spawn_in_separate_square_formations() -> None:
+    world = World(seed=5)
+    active = world.units.active(Faction.PLAYER)
+    centroids: list[tuple[float, float]] = []
+    for kind in (
+        UnitKind.INFANTRY,
+        UnitKind.SCOUT,
+        UnitKind.ENGINEER,
+        UnitKind.ASSASSIN,
+        UnitKind.RECRUIT,
+    ):
+        indices = active[world.units.kind[active] == int(kind)]
+        assert len(indices)
+        xs = world.units.x[indices] / world.subpixels
+        ys = world.units.y[indices] / world.subpixels
+        centroids.append((float(np.mean(xs)), float(np.mean(ys))))
+        # A square formation should not collapse into the former long mixed strip.
+        assert max(float(np.ptp(xs)), float(np.ptp(ys))) <= 300
+    for first, second in zip(centroids, centroids[1:], strict=False):
+        assert (first[0] - second[0]) ** 2 + (first[1] - second[1]) ** 2 > 300**2
+
+
 def test_move_command_changes_position() -> None:
     world = World(seed=7, spawn_armies=False)
     entity_id = world.spawn_unit(Faction.PLAYER, UnitKind.INFANTRY, 100, 100)
@@ -51,6 +77,203 @@ def test_move_command_changes_position() -> None:
     world.step(10)
     assert result.status == CommandStatus.ACCEPTED
     assert world.units.x[0] > before
+
+
+def test_short_commander_move_keeps_the_requested_cardinal_direction() -> None:
+    world = World(seed=7, army_size=100)
+    commander = world.commander_index(Faction.PLAYER)
+    assert commander is not None
+    entity_id = int(world.units.entity_id[commander])
+    start_x = float(world.units.x[commander] / world.subpixels)
+    start_y = float(world.units.y[commander] / world.subpixels)
+    payload = MovePayloadV1(
+        kind="move",
+        selection=SelectionV1(unit_ids=(entity_id,)),
+        target=PositionV1(x=start_x, y=start_y - 64),
+    )
+    assert world.execute(command(world, payload)).status == CommandStatus.ACCEPTED
+    world.step(80)
+    assert abs(float(world.units.x[commander] / world.subpixels) - start_x) < 2
+    assert float(world.units.y[commander] / world.subpixels) < start_y - 50
+
+
+def test_friendly_collision_makes_units_yield_to_the_commander() -> None:
+    world = World(seed=7, spawn_armies=False)
+    commander_id = world.spawn_unit(Faction.PLAYER, UnitKind.COMMANDER, 100, 100)
+    guard_id = world.spawn_unit(Faction.PLAYER, UnitKind.GUARD, 105, 100)
+    commander = world.units.index_of(commander_id)
+    guard = world.units.index_of(guard_id)
+    assert commander is not None and guard is not None
+    commander_before = (int(world.units.x[commander]), int(world.units.y[commander]))
+    guard_before = int(world.units.x[guard])
+    world._resolve_collisions()
+    assert (int(world.units.x[commander]), int(world.units.y[commander])) == commander_before
+    assert int(world.units.x[guard]) > guard_before
+
+
+def test_unknown_river_does_not_leak_through_move_rejection() -> None:
+    world = World(seed=7, spawn_armies=False)
+    entity_id = world.spawn_unit(Faction.PLAYER, UnitKind.INFANTRY, 1000, 1152)
+    payload = MovePayloadV1(
+        kind="move",
+        selection=SelectionV1(unit_ids=(entity_id,)),
+        target=PositionV1(x=3000, y=1152),
+    )
+
+    explored_before = world.observation(Faction.PLAYER).known_terrain
+    before = int(world.units.x[0])
+    accepted = world.execute(command(world, payload))
+    explored_after_command = world.observation(Faction.PLAYER).known_terrain
+    world.step(20)
+
+    assert accepted.status == CommandStatus.ACCEPTED
+    assert accepted.reason_code == "ok"
+    assert "河" not in accepted.message_zh
+    assert explored_after_command == explored_before
+    assert world.units.x[0] > before
+
+
+def test_known_river_requires_a_bridge_then_uses_the_bridge_deck() -> None:
+    world = World(seed=7, spawn_armies=False)
+    row = world.map.rows // 2
+    river_cols = np.flatnonzero(world.map.terrain[row] == 4)
+    start_x = (int(river_cols.min()) - 1 + 0.5) * world.map.tile_size
+    target_x = (int(river_cols.max()) + 8 + 0.5) * world.map.tile_size
+    y = (row + 0.5) * world.map.tile_size
+    entity_id = world.spawn_unit(Faction.PLAYER, UnitKind.INFANTRY, start_x, y)
+    payload = MovePayloadV1(
+        kind="move",
+        selection=SelectionV1(unit_ids=(entity_id,)),
+        target=PositionV1(x=target_x, y=y),
+    )
+
+    blocked = world.execute(command(world, payload))
+    assert blocked.status == CommandStatus.REJECTED
+    assert blocked.reason_code == "river_requires_bridge"
+
+    bridge_x, bridge_y, bridge_length, bridge_vertical = world.bridge_geometry_at(
+        float(np.mean(river_cols) * world.map.tile_size), y
+    )
+
+    bridge = Facility(
+        facility_id=1,
+        faction=int(Faction.PLAYER),
+        kind="bridge",
+        x=bridge_x,
+        y=bridge_y,
+        progress=500,
+        required_work=500,
+        minimum_engineers=8,
+        hp=600,
+        max_hp=600,
+        complete=True,
+        builder_ids=[],
+        bridge_length=bridge_length,
+        bridge_vertical=bridge_vertical,
+    )
+    world.facilities.append(bridge)
+    world._sync_bridge_navigation()
+    result = world.execute(command(world, payload))
+    assert result.status == CommandStatus.ACCEPTED
+    world.step(500)
+    unit_index = world.units.index_of(entity_id)
+    assert unit_index is not None
+    assert world.units.x[unit_index] / world.subpixels > river_cols.max() * world.map.tile_size
+
+
+def test_bridge_planning_does_not_measure_an_unexplored_opposite_bank() -> None:
+    world = World(seed=7, spawn_armies=False)
+    row = 0
+    river_cols = np.flatnonzero(world.map.terrain[row] == int(Terrain.RIVER))
+    near_bank_x = (int(river_cols.min()) - 1 + 0.5) * world.map.tile_size
+    y = (row + 0.5) * world.map.tile_size
+    world.spawn_unit(Faction.PLAYER, UnitKind.INFANTRY, near_bank_x, y)
+    river_x = (int(river_cols.min()) + 0.5) * world.map.tile_size
+
+    assert world.bridge_geometry_at(river_x, y)[2] > 0
+    assert world.known_bridge_geometry_at(Faction.PLAYER, river_x, y) is None
+
+
+def test_enemy_bridge_stays_out_of_faction_pathfinding_until_discovered() -> None:
+    world = World(seed=7, spawn_armies=False)
+    row = 0
+    river_cols = np.flatnonzero(world.map.terrain[row] == int(Terrain.RIVER))
+    river_x = (float(np.mean(river_cols)) + 0.5) * world.map.tile_size
+    river_y = (row + 0.5) * world.map.tile_size
+    x, y, length, vertical = world.bridge_geometry_at(river_x, river_y)
+    world.facilities.append(
+        Facility(
+            facility_id=1,
+            faction=int(Faction.ENEMY),
+            kind="bridge",
+            x=x,
+            y=y,
+            progress=500,
+            required_work=500,
+            minimum_engineers=8,
+            hp=600,
+            max_hp=600,
+            complete=True,
+            builder_ids=[],
+            bridge_length=length,
+            bridge_vertical=vertical,
+        )
+    )
+
+    world._sync_bridge_navigation()
+
+    assert not world._flow_fields[Faction.PLAYER].bridge_mask.any()
+    assert world._flow_fields[Faction.ENEMY].bridge_mask.any()
+
+
+def test_river_no_longer_deals_forced_crossing_damage() -> None:
+    world = World(seed=7, spawn_armies=False)
+    river_rows, river_cols = (world.map.terrain == 4).nonzero()
+    x = (int(river_cols[0]) + 0.5) * world.map.tile_size
+    y = (int(river_rows[0]) + 0.5) * world.map.tile_size
+    entity_id = world.spawn_unit(Faction.PLAYER, UnitKind.INFANTRY, x, y)
+    unit_index = world.units.index_of(entity_id)
+    assert unit_index is not None
+    hp_before = float(world.units.hp[unit_index])
+    world.step(100)
+    assert float(world.units.hp[unit_index]) == hp_before
+
+
+def test_bridge_edge_collision_push_is_restored_out_of_open_water() -> None:
+    world = World(seed=7, spawn_armies=False)
+    river_rows, river_cols = (world.map.terrain == 4).nonzero()
+    bridge_x = (int(river_cols[0]) + 0.5) * world.map.tile_size
+    bridge_y = (int(river_rows[0]) + 0.5) * world.map.tile_size
+    far_x = (int(river_cols[-1]) + 0.5) * world.map.tile_size
+    far_y = (int(river_rows[-1]) + 0.5) * world.map.tile_size
+    world.facilities.append(
+        Facility(
+            facility_id=1,
+            faction=int(Faction.PLAYER),
+            kind="bridge",
+            x=bridge_x,
+            y=bridge_y,
+            progress=500,
+            required_work=500,
+            minimum_engineers=8,
+            hp=600,
+            max_hp=600,
+            complete=True,
+            builder_ids=[],
+        )
+    )
+    entity_id = world.spawn_unit(Faction.PLAYER, UnitKind.INFANTRY, bridge_x, bridge_y)
+    unit = world.units.index_of(entity_id)
+    assert unit is not None
+    world.units.previous_x[unit] = round(bridge_x * world.subpixels)
+    world.units.previous_y[unit] = round(bridge_y * world.subpixels)
+    world.units.x[unit] = round(far_x * world.subpixels)
+    world.units.y[unit] = round(far_y * world.subpixels)
+
+    world._restore_illegal_river_entries()
+
+    assert world.units.x[unit] == world.units.previous_x[unit]
+    assert world.units.y[unit] == world.units.previous_y[unit]
 
 
 def test_recruits_convert_once_and_use_configured_stats() -> None:
@@ -76,6 +299,9 @@ def test_tactical_command_spends_stamina_and_sets_cooldown() -> None:
     assert result.status == CommandStatus.ACCEPTED
     assert world.units.stamina[1] == 70
     assert world.units.tactic_cooldown[1] > 0
+    tactic_event = next(event for event in world.events if event.kind == "tactic_started")
+    assert tactic_event.payload["kind"] == "sprint"
+    assert tactic_event.payload["unit_ids"] == [infantry]
 
 
 def test_guard_intercepts_commander_target() -> None:
@@ -109,6 +335,11 @@ def test_simultaneous_commander_deaths_are_draw() -> None:
     world.units.hp[[first_index, second_index]] = 1
     world.step()
     assert world.outcome == GameOutcome.DRAW
+    commander_deaths = [
+        event for event in world.events if event.kind == "unit_died" and event.payload["commander"]
+    ]
+    assert len(commander_deaths) == 2
+    assert all("x" in event.payload and "y" in event.payload for event in commander_deaths)
 
 
 def test_engineers_complete_bridge() -> None:
@@ -116,15 +347,173 @@ def test_engineers_complete_bridge() -> None:
     river_cells = (world.map.terrain == 4).nonzero()
     row, col = int(river_cells[0][0]), int(river_cells[1][0])
     x, y = (col + 0.5) * world.map.tile_size, (row + 0.5) * world.map.tile_size
-    ids = tuple(world.spawn_unit(Faction.PLAYER, UnitKind.ENGINEER, x, y) for _ in range(8))
+    river_cols = np.flatnonzero(world.map.terrain[row] == int(Terrain.RIVER))
+    near_bank_x = (int(river_cols.min()) - 1 + 0.5) * world.map.tile_size
+    far_bank_x = (int(river_cols.max()) + 1 + 0.5) * world.map.tile_size
+    ids = tuple(
+        world.spawn_unit(Faction.PLAYER, UnitKind.ENGINEER, near_bank_x, y) for _ in range(8)
+    )
+    world.spawn_unit(Faction.PLAYER, UnitKind.SCOUT, far_bank_x, y)
     payload = BuildPayloadV1(
         selection=SelectionV1(unit_ids=ids),
         facility_kind="bridge",
         target=PositionV1(x=x, y=y),
     )
     assert world.execute(command(world, payload)).status == CommandStatus.ACCEPTED
-    world.step(160)
+    world.step(200)
     assert world.facilities[0].complete
+
+
+def test_engineers_can_build_a_bridge_from_the_river_bank() -> None:
+    world = World(seed=7, spawn_armies=False)
+    row = world.map.rows // 2
+    river_cols = (world.map.terrain[row] == 4).nonzero()[0]
+    bridge_x = (float(river_cols.mean()) + 0.5) * world.map.tile_size
+    bridge_y = (row + 0.5) * world.map.tile_size
+    bank_x = (int(river_cols.min()) - 1 + 0.5) * world.map.tile_size
+    ids = tuple(
+        world.spawn_unit(Faction.PLAYER, UnitKind.ENGINEER, bank_x, bridge_y) for _ in range(8)
+    )
+    payload = BuildPayloadV1(
+        selection=SelectionV1(unit_ids=ids),
+        facility_kind="bridge",
+        target=PositionV1(x=bridge_x, y=bridge_y),
+    )
+    assert world.execute(command(world, payload)).status == CommandStatus.ACCEPTED
+    world.step(260)
+    assert world.facilities[0].complete
+
+
+def test_bridge_length_and_work_scale_with_local_river_width() -> None:
+    reference = World(seed=7, spawn_armies=False)
+    widths = np.sum(reference.map.terrain == 4, axis=1)
+    narrow_row = int(np.flatnonzero(widths == widths.min())[0])
+    wide_row = int(np.flatnonzero(widths == widths.max())[0])
+
+    def start_bridge(row: int) -> tuple[float, float]:
+        world = World(seed=7, spawn_armies=False)
+        river_cols = np.flatnonzero(world.map.terrain[row] == 4)
+        x = (float(np.mean(river_cols)) + 0.5) * world.map.tile_size
+        y = (row + 0.5) * world.map.tile_size
+        ids = tuple(world.spawn_unit(Faction.PLAYER, UnitKind.ENGINEER, x, y) for _ in range(8))
+        payload = BuildPayloadV1(
+            selection=SelectionV1(unit_ids=ids),
+            facility_kind="bridge",
+            target=PositionV1(x=x, y=y),
+        )
+        assert world.execute(command(world, payload)).status == CommandStatus.ACCEPTED
+        facility = world.facilities[-1]
+        half_length = facility.bridge_length / 2
+        endpoint_x = 0.0 if facility.bridge_vertical else half_length
+        endpoint_y = half_length if facility.bridge_vertical else 0.0
+        endpoints = world.map.terrain_at(
+            np.asarray([facility.x - endpoint_x, facility.x + endpoint_x]),
+            np.asarray([facility.y - endpoint_y, facility.y + endpoint_y]),
+        )
+        assert np.all(endpoints != int(Terrain.RIVER))
+        return facility.bridge_length, facility.required_work
+
+    narrow_length, narrow_work = start_bridge(narrow_row)
+    wide_length, wide_work = start_bridge(wide_row)
+
+    assert wide_length > narrow_length
+    assert wide_work > narrow_work
+
+
+def test_bridge_passability_matches_the_visible_rectangular_deck() -> None:
+    world = World(seed=7, spawn_armies=False)
+    row = world.map.rows // 2
+    river_cols = np.flatnonzero(world.map.terrain[row] == int(Terrain.RIVER))
+    x = (float(np.mean(river_cols)) + 0.5) * world.map.tile_size
+    y = (row + 0.5) * world.map.tile_size
+    bridge_x, bridge_y, length, vertical = world.bridge_geometry_at(x, y)
+    facility = Facility(
+        facility_id=1,
+        faction=int(Faction.PLAYER),
+        kind="bridge",
+        x=bridge_x,
+        y=bridge_y,
+        progress=500,
+        required_work=500,
+        minimum_engineers=8,
+        hp=600,
+        max_hp=600,
+        complete=True,
+        builder_ids=[],
+        bridge_length=length,
+        bridge_vertical=vertical,
+    )
+    world.facilities.append(facility)
+    across_x = BRIDGE_DECK_HALF_WIDTH + 1 if vertical else 0
+    across_y = 0 if vertical else BRIDGE_DECK_HALF_WIDTH + 1
+
+    assert world._positions_on_bridges(np.asarray([bridge_x]), np.asarray([bridge_y])).item()
+    assert not world._positions_on_bridges(
+        np.asarray([bridge_x + across_x]), np.asarray([bridge_y + across_y])
+    ).item()
+
+
+def test_collision_push_is_clamped_inside_bridge_rails() -> None:
+    world = World(seed=7, spawn_armies=False)
+    row = world.map.rows // 2
+    river_cols = np.flatnonzero(world.map.terrain[row] == int(Terrain.RIVER))
+    x = (float(np.mean(river_cols)) + 0.5) * world.map.tile_size
+    y = (row + 0.5) * world.map.tile_size
+    bridge_x, bridge_y, length, vertical = world.bridge_geometry_at(x, y)
+    facility = Facility(
+        facility_id=1,
+        faction=int(Faction.PLAYER),
+        kind="bridge",
+        x=bridge_x,
+        y=bridge_y,
+        progress=500,
+        required_work=500,
+        minimum_engineers=8,
+        hp=600,
+        max_hp=600,
+        complete=True,
+        builder_ids=[],
+        bridge_length=length,
+        bridge_vertical=vertical,
+    )
+    world.facilities.append(facility)
+    entity_id = world.spawn_unit(Faction.PLAYER, UnitKind.INFANTRY, bridge_x, bridge_y)
+    unit = world.units.index_of(entity_id)
+    assert unit is not None
+    world.units.previous_x[unit] = round(bridge_x * world.subpixels)
+    world.units.previous_y[unit] = round(bridge_y * world.subpixels)
+    pushed = BRIDGE_DECK_HALF_WIDTH + 12
+    if vertical:
+        world.units.x[unit] = round((bridge_x + pushed) * world.subpixels)
+    else:
+        world.units.y[unit] = round((bridge_y + pushed) * world.subpixels)
+
+    world._constrain_units_to_bridge_decks()
+    world._restore_illegal_river_entries()
+
+    unit_x = float(world.units.x[unit] / world.subpixels)
+    unit_y = float(world.units.y[unit] / world.subpixels)
+    across = abs(unit_x - bridge_x) if vertical else abs(unit_y - bridge_y)
+    assert across <= BRIDGE_DECK_HALF_WIDTH - float(world.units.radius[unit]) + 0.01
+    assert world._positions_on_bridges(np.asarray([unit_x]), np.asarray([unit_y])).item()
+
+
+def test_building_rejects_overlapping_facilities() -> None:
+    world = World(seed=7, spawn_armies=False)
+    plain_rows, plain_cols = (world.map.terrain == 0).nonzero()
+    x = (int(plain_cols[0]) + 0.5) * world.map.tile_size
+    y = (int(plain_rows[0]) + 0.5) * world.map.tile_size
+    ids = tuple(world.spawn_unit(Faction.PLAYER, UnitKind.ENGINEER, x, y) for _ in range(10))
+    first = BuildPayloadV1(
+        selection=SelectionV1(unit_ids=ids),
+        facility_kind="tower",
+        target=PositionV1(x=x, y=y),
+    )
+    second = first.model_copy(update={"target": PositionV1(x=x + 10, y=y)})
+    assert world.execute(command(world, first)).status == CommandStatus.ACCEPTED
+    rejected = world.execute(command(world, second))
+    assert rejected.status == CommandStatus.REJECTED
+    assert rejected.reason_code == "facility_overlap"
 
 
 def test_custom_army_composition_is_exact() -> None:
@@ -142,7 +531,7 @@ def test_custom_army_composition_is_exact() -> None:
     assert sum(world.units.kind[player] == int(UnitKind.RECRUIT)) == 15
 
 
-def test_tower_capacity_and_exit_restore_infantry() -> None:
+def test_tower_auto_garrisons_builders_then_respects_capacity_and_exit() -> None:
     world = World(seed=9, spawn_armies=False)
     engineers = tuple(
         world.spawn_unit(Faction.PLAYER, UnitKind.ENGINEER, 300, 300) for _ in range(10)
@@ -155,6 +544,10 @@ def test_tower_capacity_and_exit_restore_infantry() -> None:
     assert world.execute(command(world, build)).status == CommandStatus.ACCEPTED
     world.step(170)
     tower = world.facilities[0]
+    builder_indices = world.resolve_selection(SelectionV1(unit_ids=engineers), Faction.PLAYER)
+    assert all(world.units.facility_id[builder_indices] == tower.facility_id)
+    assert all(world.units.kind[builder_indices] == int(UnitKind.INFANTRY))
+    assert min(world.units.attack_range[builder_indices]) == 260
     infantry = tuple(
         world.spawn_unit(Faction.PLAYER, UnitKind.INFANTRY, 320, 300) for _ in range(25)
     )
@@ -167,7 +560,7 @@ def test_tower_capacity_and_exit_restore_infantry() -> None:
     assert result.status == CommandStatus.ACCEPTED
     occupants = world.resolve_selection(SelectionV1(unit_ids=infantry), Faction.PLAYER)
     inside = occupants[world.units.facility_id[occupants] == tower.facility_id]
-    assert len(inside) == 20
+    assert len(inside) == 10
     assert min(world.units.attack_range[inside]) == 260
     leave = FacilityActionPayloadV1(
         kind="exit_tower",
@@ -191,7 +584,7 @@ def test_boat_capacity_movement_and_disembark() -> None:
         target=PositionV1(x=x, y=y),
     )
     assert world.execute(command(world, build)).status == CommandStatus.ACCEPTED
-    world.step(160)
+    world.step(180)
     boat = world.facilities[0]
     passengers = tuple(
         world.spawn_unit(Faction.PLAYER, UnitKind.INFANTRY, x + 10, y) for _ in range(25)

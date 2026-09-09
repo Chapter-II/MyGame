@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 
 class FogOfWar:
-    """Owns faction-specific visibility; never exposes the authority object."""
+    """Owns faction-specific, permanently revealed visibility."""
 
     def __init__(self, rows: int, cols: int, tile_size: int) -> None:
         self.rows = rows
@@ -29,7 +29,9 @@ class FogOfWar:
         self._observation_cache.clear()
 
     def update(self, world: World) -> None:
-        self.visible[:] = False
+        # Revealed cells stay globally observable for that faction. ``visible`` is
+        # retained in saves for backward compatibility and mirrors ``explored``.
+        self.visible |= self.explored
         self._observation_cache.clear()
         for faction in (Faction.PLAYER, Faction.ENEMY):
             active = world.units.active(faction)
@@ -58,10 +60,11 @@ class FogOfWar:
                 for row, col, radius in reveals:
                     self._reveal_cells(int(faction), int(row), int(col), int(radius))
             self.explored[int(faction)] |= self.visible[int(faction)]
+            self.visible[int(faction)] = self.explored[int(faction)]
             for village in world.map.villages:
                 col = int(np.clip(village.x // self.tile_size, 0, self.cols - 1))
                 row = int(np.clip(village.y // self.tile_size, 0, self.rows - 1))
-                if self.visible[int(faction), row, col]:
+                if self.explored[int(faction), row, col]:
                     self.village_history[int(faction)][village.village_id] = {
                         "village_id": village.village_id,
                         "x": village.x,
@@ -105,7 +108,7 @@ class FogOfWar:
             0,
             self.rows - 1,
         )
-        visible = self.visible[int(faction), rows, cols]
+        visible = self.explored[int(faction), rows, cols]
         hidden_assassin = (
             world.units.kind[enemy] == int(UnitKind.ASSASSIN)
         ) & ~world.units.exposed[enemy]
@@ -132,7 +135,23 @@ class FogOfWar:
         own = tuple(self._unit(world, int(index)) for index in world.units.active(faction))
         visible_indices = self._visible_enemy_indices(world, faction)
         enemies = tuple(self._unit(world, int(index)) for index in visible_indices)
-        known_villages = list(self.village_history[int(faction)].values())
+        known_villages: list[dict[str, Any]] = []
+        for village in world.map.villages:
+            col = int(np.clip(village.x // self.tile_size, 0, self.cols - 1))
+            row = int(np.clip(village.y // self.tile_size, 0, self.rows - 1))
+            if self.explored[int(faction), row, col]:
+                live = {
+                    "village_id": village.village_id,
+                    "x": village.x,
+                    "y": village.y,
+                    "population": village.population,
+                    "size": village.size,
+                    "last_seen_tick": world.tick,
+                }
+                self.village_history[int(faction)][village.village_id] = live
+                known_villages.append(live)
+            elif village.village_id in self.village_history[int(faction)]:
+                known_villages.append(self.village_history[int(faction)][village.village_id])
         known_facilities = tuple(
             {
                 "facility_id": item.facility_id,
@@ -146,7 +165,7 @@ class FogOfWar:
             }
             for item in world.facilities
             if item.faction == int(faction)
-            or self.visible[
+            or self.explored[
                 int(faction), int(item.y // self.tile_size), int(item.x // self.tile_size)
             ]
         )
@@ -179,6 +198,8 @@ class FogOfWar:
         fog = cls(rows, cols, tile_size)
         fog.visible = np.asarray(data["visible"], dtype=np.bool_)
         fog.explored = np.asarray(data["explored"], dtype=np.bool_)
+        # Old saves may contain a smaller transient visibility mask.
+        fog.visible |= fog.explored
         fog.history = [
             {int(entity_id): sighting for entity_id, sighting in side.items()}
             for side in data["history"]

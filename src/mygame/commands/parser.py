@@ -259,9 +259,7 @@ class RuleCommandParser:
             )
         elif "保护" in cleaned:
             # Protect commander: all units rally around commander
-            commander = next(
-                (u for u in observation.own_units if u.kind == "commander"), None
-            )
+            commander = next((u for u in observation.own_units if u.kind == "commander"), None)
             if commander:
                 protect_selection = SelectionV1()  # empty = all units
                 envelope = CommandEnvelopeV1(
@@ -298,8 +296,12 @@ class RuleCommandParser:
                 avg_x, avg_y = self.world_width * 0.5, self.world_height * 0.5
             # Move away from enemies
             if observation.visible_enemies:
-                enemy_x = sum(e.x for e in observation.visible_enemies) / len(observation.visible_enemies)
-                enemy_y = sum(e.y for e in observation.visible_enemies) / len(observation.visible_enemies)
+                enemy_x = sum(e.x for e in observation.visible_enemies) / len(
+                    observation.visible_enemies
+                )
+                enemy_y = sum(e.y for e in observation.visible_enemies) / len(
+                    observation.visible_enemies
+                )
                 dx = avg_x - enemy_x
                 dy = avg_y - enemy_y
                 dist = (dx * dx + dy * dy) ** 0.5 or 1.0
@@ -307,7 +309,11 @@ class RuleCommandParser:
                 retreat_y = avg_y + dy / dist * 300
             else:
                 # Default: retreat toward own side
-                retreat_x = self.world_width * 0.85 if int(observation.faction) == 0 else self.world_width * 0.15
+                retreat_x = (
+                    self.world_width * 0.85
+                    if int(observation.faction) == 0
+                    else self.world_width * 0.15
+                )
                 retreat_y = self.world_height * 0.5
             retreat_x = max(0.0, min(self.world_width, retreat_x))
             retreat_y = max(0.0, min(self.world_height, retreat_y))
@@ -324,7 +330,19 @@ class RuleCommandParser:
             )
         elif any(
             word in cleaned
-            for word in ("前往", "移动", "出发", "攻击", "进攻", "搜索", "侦察", "守住", "前进", "推进", "进军")
+            for word in (
+                "前往",
+                "移动",
+                "出发",
+                "攻击",
+                "进攻",
+                "搜索",
+                "侦察",
+                "守住",
+                "前进",
+                "推进",
+                "进军",
+            )
         ):
             attack = any(word in cleaned for word in ("攻击", "进攻", "搜索", "侦察", "进军"))
             envelope = CommandEnvelopeV1(
@@ -495,7 +513,7 @@ class CommandSuggester:
         # If no specific match, try generic partial matching
         if not suggestions:
             for keywords, templates in _UNIT_TEMPLATES.items():
-                if any(cleaned.startswith(kw[:len(cleaned)]) for kw in keywords.split()):
+                if any(cleaned.startswith(kw[: len(cleaned)]) for kw in keywords.split()):
                     for tpl in templates[:2]:
                         suggestion = self._fill_template(tpl, cleaned, observation)
                         if suggestion and suggestion not in suggestions:
@@ -513,9 +531,7 @@ class CommandSuggester:
                 suggestions[0] = "第一战团集火敌方将领"
         return suggestions[:3]
 
-    def _fill_template(
-        self, tpl: str, cleaned: str, obs: ObservationSnapshotV1
-    ) -> str | None:
+    def _fill_template(self, tpl: str, cleaned: str, obs: ObservationSnapshotV1) -> str | None:
         result = tpl
 
         # Fill group references
@@ -533,10 +549,6 @@ class CommandSuggester:
             if obs.known_villages:
                 anchor = obs.own_units[0] if obs.own_units else None
                 if anchor:
-                    nearest = min(
-                        obs.known_villages,
-                        key=lambda v: (float(v["x"]) - anchor.x) ** 2 + (float(v["y"]) - anchor.y) ** 2,
-                    )
                     result = result.replace("{village}", "最近村庄")
                 else:
                     result = result.replace("{village}", "最近村庄")

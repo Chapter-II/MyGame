@@ -6,20 +6,22 @@ import os
 import sys
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pygame
 
 from mygame.ai import LocalStrategicAI
 from mygame.commands import DeepSeekCommandParser, RuleCommandParser
+from mygame.constants import BRIDGE_DECK_HALF_WIDTH, ENEMY_CLICK_RADIUS_SQ, UNIT_CLICK_RADIUS_SQ
 from mygame.input import MicrophoneRecorder, VoiceUnavailable, WhisperRecognizer
-from mygame.maps import generate_map
+from mygame.maps import Terrain, generate_map
 from mygame.persistence import (
     ReplayPlayer,
     ReplayRecorder,
@@ -28,25 +30,29 @@ from mygame.persistence import (
     SettingsV1,
 )
 from mygame.protocols import (
+    BuildPayloadV1,
     CommandEnvelopeV1,
     CommandResultV1,
     CommandSource,
     CommandStatus,
+    ConvertPayloadV1,
     Faction,
     FocusFirePayloadV1,
     GroupPayloadV1,
     MovePayloadV1,
     PositionV1,
     QueueMode,
+    RecruitPayloadV1,
     SelectionV1,
 )
-from mygame.rendering import Theme
+from mygame.rendering import ArtBook, Theme
 from mygame.simulation import GameOutcome, UnitKind, World
-from mygame.constants import ENEMY_CLICK_RADIUS_SQ, UNIT_CLICK_RADIUS_SQ
 
 logger = logging.getLogger(__name__)
 LOGICAL_SIZE = (1280, 720)
 BATTLE_RECT = pygame.Rect(0, 40, 960, 548)
+MINIMAP_RECT = pygame.Rect(980, 548, 280, 152)
+MIN_WINDOW_SIZE = (480, 270)
 
 
 @dataclass(slots=True)
@@ -57,11 +63,39 @@ class Button:
     enabled: bool = True
 
 
+@dataclass(slots=True)
+class TextCommand:
+    text: str
+    x: int
+    y: int
+    size: int
+    color: tuple[int, int, int]
+    bold: bool
+    center: bool
+    center_y: bool
+
+
+@dataclass(slots=True)
+class BattleEffect:
+    kind: str
+    x: float
+    y: float
+    target_x: float
+    target_y: float
+    duration: float
+    age: float = 0.0
+    size: int = 28
+    faction: int = 0
+
+
 class FontBook:
     def __init__(self, scale: float = 1.0) -> None:
         self.scale = scale
         self.path = self._find_font()
         self.cache: dict[tuple[int, bool], pygame.font.Font] = {}
+        self.render_cache: OrderedDict[
+            tuple[str, int, bool, tuple[int, int, int], int], pygame.Surface
+        ] = OrderedDict()
 
     @staticmethod
     def _find_font() -> str | None:
@@ -87,13 +121,33 @@ class FontBook:
                 return path
         return None
 
-    def get(self, size: int, bold: bool = False) -> pygame.font.Font:
-        key = (max(10, round(size * self.scale)), bold)
+    def get(self, size: int, bold: bool = False, resolution_scale: float = 1.0) -> pygame.font.Font:
+        key = (max(8, round(size * self.scale * resolution_scale)), bold)
         if key not in self.cache:
             font = pygame.font.Font(self.path, key[0])
             font.set_bold(bold)
             self.cache[key] = font
         return self.cache[key]
+
+    def render(
+        self,
+        text: str,
+        size: int,
+        color: tuple[int, int, int],
+        bold: bool = False,
+        resolution_scale: float = 1.0,
+    ) -> pygame.Surface:
+        scale_key = round(resolution_scale * 1000)
+        key = (text, size, bold, color, scale_key)
+        cached = self.render_cache.get(key)
+        if cached is not None:
+            self.render_cache.move_to_end(key)
+            return cached
+        surface = self.get(size, bold, resolution_scale).render(text, True, color)
+        self.render_cache[key] = surface
+        if len(self.render_cache) > 768:
+            self.render_cache.popitem(last=False)
+        return surface
 
 
 class SoundBook:
@@ -134,6 +188,9 @@ class Camera:
         self.x = world.map.width / 2
         self.y = world.map.height / 2
         self.zoom = 0.235
+        self.target_zoom = self.zoom
+        self.zoom_anchor_screen: tuple[int, int] = BATTLE_RECT.center
+        self.zoom_anchor_world: tuple[float, float] | None = None
 
     def world_to_screen(self, x: float, y: float) -> tuple[int, int]:
         sx = BATTLE_RECT.centerx + (x - self.x) * self.zoom
@@ -163,6 +220,7 @@ class GameApp:
         if sys.platform == "win32":
             try:
                 import ctypes
+
                 ctypes.windll.shcore.SetProcessDpiAwareness(1)
             except Exception:
                 logger.debug("DPI 感知设置失败", exc_info=True)
@@ -171,17 +229,16 @@ class GameApp:
         self.theme = Theme()
         self.settings_manager = SettingsManager()
         self.settings = self.settings_manager.load()
-        base_flags = pygame.FULLSCREEN if self.settings.fullscreen else pygame.RESIZABLE
-        try:
-            self.screen = pygame.display.set_mode(LOGICAL_SIZE, base_flags | pygame.SCALED)
-            self._scaled_mode = True
-        except Exception:
-            self.screen = pygame.display.set_mode(LOGICAL_SIZE, base_flags)
-            self._scaled_mode = False
+        self.fullscreen = self.settings.fullscreen
+        self._windowed_size = self._initial_window_size()
+        self.screen = self._set_display_mode(self.fullscreen)
         pygame.display.set_caption("指挥官战术对抗")
         self.canvas = pygame.Surface(LOGICAL_SIZE)
         self.clock = pygame.time.Clock()
-        self.fonts = FontBook(self.settings.ui_scale)
+        self.fonts = FontBook(float(np.clip(self.settings.ui_scale, 0.9, 1.35)))
+        self.art = ArtBook()
+        self._text_commands: list[TextCommand] = []
+        self._native_text = False
         self.sounds = SoundBook(self.settings.master_volume)
         self.running = True
         self.scene = "menu"
@@ -190,6 +247,8 @@ class GameApp:
         self.world: World | None = None
         self.camera: Camera | None = None
         self.ai: LocalStrategicAI | None = None
+        self.player_ai: LocalStrategicAI | None = None
+        self.auto_command = False
         self.save_manager = SaveManager()
         self.recorder: ReplayRecorder | None = None
         self.replay_player: ReplayPlayer | None = None
@@ -208,26 +267,36 @@ class GameApp:
         self.recording = False
         self.selected_ids: set[int] = set()
         self.drag_start: tuple[int, int] | None = None
+        self.minimap_dragging = False
+        self.context_menu_point: tuple[int, int] | None = None
+        self.context_menu_world: tuple[float, float] | None = None
         self.command_input = ""
         self.composition = ""
         self.typing = False
         self.suggestions: list[str] = []
         self.selected_suggestion = 0
         self.messages: list[tuple[str, tuple[int, int, int]]] = []
+        self.battle_effects: list[BattleEffect] = []
+        self.result_cinematic_time = 0.0
+        self.result_cinematic_duration = 1.35
+        self.cinematic_target: tuple[float, float] | None = None
         self.paused = False
         self.speed = 1.0
         self.accumulator = 0.0
         self.help_open = False
         self.reduced_motion = self.settings.reduced_motion
-        self.fullscreen = self.settings.fullscreen
         self.last_event_index = 0
         self.stats = {"player_losses": 0, "enemy_losses": 0}
         self.result_sound_played = False
         self.tick_timings: deque[float] = deque(maxlen=240)
         self._terrain_cache: pygame.Surface | None = None
-        self._terrain_cache_key: tuple = ()
+        self._terrain_cache_key: tuple[object, ...] = ()
+        self._terrain_world_surface: pygame.Surface | None = None
+        self._terrain_world_key: tuple[object, ...] = ()
+        self._fogged_world_surface: pygame.Surface | None = None
+        self._fogged_world_key: tuple[object, ...] = ()
         self._minimap_cache: pygame.Surface | None = None
-        self._minimap_cache_key: tuple = ()
+        self._minimap_cache_key: tuple[object, ...] = ()
         self.setup_seed = 20260907
         self.setup_symmetric = True
         self.setup_army_size = 500
@@ -239,6 +308,38 @@ class GameApp:
         self.pending_retry_text: str | None = None
         self.provider_retry_count = 0
         self.ambiguity_candidates: list[CommandEnvelopeV1] = []
+
+    @staticmethod
+    def _desktop_size() -> tuple[int, int]:
+        try:
+            sizes = pygame.display.get_desktop_sizes()
+            if sizes and sizes[0][0] > 0 and sizes[0][1] > 0:
+                return sizes[0]
+        except (AttributeError, pygame.error):
+            logger.debug("无法读取桌面分辨率", exc_info=True)
+        info = pygame.display.Info()
+        if info.current_w > 0 and info.current_h > 0:
+            return info.current_w, info.current_h
+        return LOGICAL_SIZE
+
+    def _initial_window_size(self) -> tuple[int, int]:
+        desktop_w, desktop_h = self._desktop_size()
+        scale = min(
+            1.0,
+            (desktop_w - 64) / LOGICAL_SIZE[0],
+            (desktop_h - 96) / LOGICAL_SIZE[1],
+        )
+        scale = max(0.25, scale)
+        return round(LOGICAL_SIZE[0] * scale), round(LOGICAL_SIZE[1] * scale)
+
+    def _set_display_mode(self, fullscreen: bool) -> pygame.Surface:
+        if fullscreen:
+            try:
+                return pygame.display.set_mode(self._desktop_size(), pygame.FULLSCREEN)
+            except pygame.error:
+                logger.warning("全屏模式不可用，已回退到自适应窗口", exc_info=True)
+                self.fullscreen = False
+        return pygame.display.set_mode(self._windowed_size, pygame.RESIZABLE)
 
     def run(self, max_frames: int | None = None) -> int:
         frames = 0
@@ -261,6 +362,10 @@ class GameApp:
     def new_battle(self) -> None:
         self._terrain_cache = None
         self._terrain_cache_key = ()
+        self._terrain_world_surface = None
+        self._terrain_world_key = ()
+        self._fogged_world_surface = None
+        self._fogged_world_key = ()
         self._minimap_cache = None
         self._minimap_cache_key = ()
         battle_map = generate_map(seed=self.setup_seed, symmetric=self.setup_symmetric)
@@ -280,8 +385,19 @@ class GameApp:
             self.world.map.width,
             self.world.map.height,
             difficulty=self.setup_difficulty,
-            config=self.world.balance.ai.get(self.setup_difficulty, self.world.balance.ai["normal"]),
+            config=self.world.balance.ai.get(
+                self.setup_difficulty, self.world.balance.ai["normal"]
+            ),
         )
+        self.player_ai = LocalStrategicAI(
+            self.world.map.width,
+            self.world.map.height,
+            difficulty=self.setup_difficulty,
+            config=self.world.balance.ai.get(
+                self.setup_difficulty, self.world.balance.ai["normal"]
+            ),
+        )
+        self.auto_command = False
         self.recorder = ReplayRecorder(self.world)
         self.replay_player = None
         self.view_faction = Faction.PLAYER
@@ -293,10 +409,23 @@ class GameApp:
         self.last_event_index = 0
         self.stats = {"player_losses": 0, "enemy_losses": 0}
         self.result_sound_played = False
+        self.context_menu_point = None
+        self.context_menu_world = None
+        self.battle_effects.clear()
+        self.result_cinematic_time = 0.0
+        self.cinematic_target = None
 
     def load_battle(self) -> None:
         try:
             self.world = self.save_manager.load()
+            self.battle_effects.clear()
+            self.result_cinematic_time = 0.0
+            self.cinematic_target = None
+            self._terrain_world_surface = None
+            self._terrain_world_key = ()
+            self._fogged_world_surface = None
+            self._fogged_world_key = ()
+            self._minimap_cache = None
             self.rule_parser.world_width = self.world.map.width
             self.rule_parser.world_height = self.world.map.height
             self.rule_parser.suggester.world_width = self.world.map.width
@@ -307,6 +436,12 @@ class GameApp:
                 self.world.map.height,
                 config=self.world.balance.ai.get("normal", {}),
             )
+            self.player_ai = LocalStrategicAI(
+                self.world.map.width,
+                self.world.map.height,
+                config=self.world.balance.ai.get("normal", {}),
+            )
+            self.auto_command = False
             self.recorder = ReplayRecorder(self.world)
             self.replay_player = None
             self.view_faction = Faction.PLAYER
@@ -327,8 +462,18 @@ class GameApp:
         try:
             self.replay_player = ReplayPlayer(self.save_manager.load_replay(path))
             self.world = self.replay_player.world
+            self.battle_effects.clear()
+            self.result_cinematic_time = 0.0
+            self.cinematic_target = None
+            self._terrain_world_surface = None
+            self._terrain_world_key = ()
+            self._fogged_world_surface = None
+            self._fogged_world_key = ()
+            self._minimap_cache = None
             self.camera = Camera(self.world)
             self.ai = None
+            self.player_ai = None
+            self.auto_command = False
             self.recorder = None
             self.scene = "replay"
             self.paused = False
@@ -342,8 +487,12 @@ class GameApp:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
-            elif event.type == pygame.VIDEORESIZE and not self.fullscreen and not self._scaled_mode:
-                self.screen = pygame.display.set_mode(event.size, pygame.RESIZABLE)
+            elif event.type == pygame.VIDEORESIZE and not self.fullscreen:
+                self._windowed_size = (
+                    max(MIN_WINDOW_SIZE[0], event.w),
+                    max(MIN_WINDOW_SIZE[1], event.h),
+                )
+                self.screen = pygame.display.set_mode(self._windowed_size, pygame.RESIZABLE)
             elif event.type == pygame.WINDOWFOCUSLOST and self.recording:
                 self.recording = False
                 self._message("窗口失焦，语音录制已取消。", self.theme.warning)
@@ -372,7 +521,7 @@ class GameApp:
                 return
         if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
             point = self._logical_mouse(event.pos)
-            for index, button in enumerate(self.buttons):
+            for button in self.buttons:
                 if button.enabled and button.rect.collidepoint(point):
                     button.action()
                     # Update focus to clicked button
@@ -396,12 +545,31 @@ class GameApp:
         if event.type == pygame.TEXTEDITING and self.typing:
             self.composition = event.text
             return
-        if self.scene == "result" and event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
             point = self._logical_mouse(event.pos)
-            for button in self.buttons:
+            candidates = self.buttons
+            if self.help_open:
+                candidates = [button for button in candidates if button.label == "关闭"]
+            elif self.paused and self.scene == "battle":
+                pause_panel = pygame.Rect(400, 190, 480, 330)
+                candidates = [button for button in candidates if pause_panel.contains(button.rect)]
+            for button in reversed(candidates):
                 if button.enabled and button.rect.collidepoint(point):
+                    self.drag_start = None
                     button.action()
                     return
+            if self.context_menu_point is not None:
+                self.context_menu_point = None
+                self.context_menu_world = None
+                self.drag_start = None
+                return
+        if event.type in {
+            pygame.MOUSEBUTTONDOWN,
+            pygame.MOUSEBUTTONUP,
+            pygame.MOUSEMOTION,
+            pygame.MOUSEWHEEL,
+        } and (self.help_open or (self.paused and self.scene == "battle")):
+            return
         if event.type == pygame.KEYDOWN:
             if self.scene == "replay":
                 if event.key == pygame.K_F2:
@@ -457,7 +625,9 @@ class GameApp:
                         self.selected_suggestion = max(0, self.selected_suggestion - 1)
                 elif event.key == pygame.K_DOWN:
                     if self.suggestions:
-                        self.selected_suggestion = min(len(self.suggestions) - 1, self.selected_suggestion + 1)
+                        self.selected_suggestion = min(
+                            len(self.suggestions) - 1, self.selected_suggestion + 1
+                        )
                 elif event.key == pygame.K_BACKSPACE:
                     self.command_input = self.command_input[:-1]
                     self._refresh_suggestions()
@@ -477,13 +647,7 @@ class GameApp:
                     self.sounds.play("command")
                 return
             if event.key == pygame.K_RETURN:
-                self.typing = True
-                self.command_input = ""
-                self.composition = ""
-                self._refresh_suggestions()
-                if hasattr(pygame.key, "start_text_input"):
-                    self._update_ime_rect()
-                    pygame.key.start_text_input()
+                self._begin_text_input()
             elif event.key == pygame.K_ESCAPE:
                 if self.help_open:
                     self.help_open = False
@@ -492,17 +656,13 @@ class GameApp:
             elif event.key == pygame.K_F1:
                 self.help_open = not self.help_open
             elif event.key == pygame.K_F5 and self.scene == "battle":
-                try:
-                    path = self.save_manager.save(self.world)
-                    self._message(f"已保存：{path.name}", self.theme.success)
-                except OSError as exc:
-                    self._message(f"保存失败：{exc}", self.theme.enemy)
+                self._quick_save()
             elif event.key == pygame.K_F9 and self.scene == "battle":
                 self.load_battle()
             elif event.key == pygame.K_F11:
                 self._toggle_fullscreen()
             elif event.key == pygame.K_SPACE:
-                self.paused = not self.paused
+                self._toggle_pause()
             elif event.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
                 self.speed = min(4.0, self.speed * 2)
             elif event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
@@ -557,23 +717,24 @@ class GameApp:
             self.pending_voice = self.executor.submit(self.whisper.transcribe, samples)
         elif event.type == pygame.MOUSEBUTTONDOWN:
             point = self._logical_mouse(event.pos)
-            if event.button == 1 and BATTLE_RECT.collidepoint(point):
+            if event.button == 1 and MINIMAP_RECT.collidepoint(point):
+                self.minimap_dragging = True
+                self._camera_from_minimap(point)
+            elif event.button == 1 and self.context_menu_point is not None:
+                return
+            elif event.button == 1 and BATTLE_RECT.collidepoint(point):
                 self.drag_start = point
             elif event.button == 2 and BATTLE_RECT.collidepoint(point):
                 self.drag_start = point
             elif event.button == 3 and BATTLE_RECT.collidepoint(point) and self.scene == "battle":
-                self._mouse_order(
-                    point,
-                    pygame.key.get_pressed()[pygame.K_a],
-                    pygame.key.get_mods() & pygame.KMOD_SHIFT,
-                )
-            elif event.button in (4, 5) and BATTLE_RECT.collidepoint(point):
-                factor = 1.16 if event.button == 4 else 1 / 1.16
-                self.camera.zoom = float(np.clip(self.camera.zoom * factor, 0.18, 1.5))
-                self.camera.clamp(self.world)
+                self._open_context_menu(point)
         elif event.type == pygame.MOUSEBUTTONUP:
             point = self._logical_mouse(event.pos)
-            if (
+            if event.button == 1 and self.minimap_dragging:
+                self._camera_from_minimap(point)
+                self.minimap_dragging = False
+                self.drag_start = None
+            elif (
                 event.button == 1
                 and self.scene == "replay"
                 and self.replay_player is not None
@@ -587,12 +748,26 @@ class GameApp:
                 self.drag_start = None
             elif event.button == 2:
                 self.drag_start = None
-        elif event.type == pygame.MOUSEMOTION and event.buttons[1] and self.drag_start:
-            dx = event.rel[0] / max(self.screen.get_width() / LOGICAL_SIZE[0], 0.01)
-            dy = event.rel[1] / max(self.screen.get_height() / LOGICAL_SIZE[1], 0.01)
-            self.camera.x -= dx / self.camera.zoom
-            self.camera.y -= dy / self.camera.zoom
-            self.camera.clamp(self.world)
+        elif event.type == pygame.MOUSEMOTION:
+            point = self._logical_mouse(event.pos)
+            if self.minimap_dragging and event.buttons[0]:
+                self._camera_from_minimap(point)
+            elif event.buttons[1] and self.drag_start:
+                viewport = self._viewport()
+                dx = event.rel[0] / max(viewport.width / LOGICAL_SIZE[0], 0.01)
+                dy = event.rel[1] / max(viewport.height / LOGICAL_SIZE[1], 0.01)
+                self.camera.zoom_anchor_world = None
+                self.camera.x -= dx / self.camera.zoom
+                self.camera.y -= dy / self.camera.zoom
+                self.camera.clamp(self.world)
+        elif event.type == pygame.MOUSEWHEEL:
+            point = self._logical_mouse(pygame.mouse.get_pos())
+            amount = float(getattr(event, "precise_y", event.y))
+            if MINIMAP_RECT.collidepoint(point):
+                self._camera_from_minimap(point)
+                self._request_zoom(1.16**amount, BATTLE_RECT.center)
+            elif BATTLE_RECT.collidepoint(point):
+                self._request_zoom(1.16**amount, point)
 
     def _logical_mouse(self, point: tuple[int, int]) -> tuple[int, int]:
         viewport = self._viewport()
@@ -612,6 +787,7 @@ class GameApp:
             pygame.key.stop_text_input()
         # Split compound commands on conjunctions
         import re
+
         segments = re.split(r"\s*(?:然后|接着|并且|同时|再|并)\s*", text)
         segments = [s.strip() for s in segments if s.strip()]
         if not segments:
@@ -624,8 +800,18 @@ class GameApp:
         if executed > 1:
             self._message(f"已执行 {executed} 条指令。", self.theme.success)
 
+    def _pick_suggestion(self, index: int) -> None:
+        if index >= len(self.suggestions):
+            return
+        self.command_input = self.suggestions[index]
+        self.selected_suggestion = index
+        self.suggestions = []
+        self._update_ime_rect()
+
     def _execute_single_command(self, text: str) -> bool:
         """Parse and execute one command segment. Returns False if rejected."""
+        if self.world is None:
+            return False
         parsed = self.rule_parser.parse(text, self.world.observation(Faction.PLAYER))
         if parsed.status == CommandStatus.PENDING and parsed.candidates:
             if len(parsed.candidates) > 1:
@@ -667,7 +853,7 @@ class GameApp:
             return
         viewport = self._viewport()
         scale = viewport.width / LOGICAL_SIZE[0]
-        box = pygame.Rect(340, 618, 590, 42)
+        box = pygame.Rect(342, 636, 484, 38)
         screen_rect = pygame.Rect(
             viewport.x + int(box.x * scale),
             viewport.y + int(box.y * scale),
@@ -684,6 +870,8 @@ class GameApp:
             return
         self.provider_retry_count += 1
         self.paused = True
+        self.context_menu_point = None
+        self.context_menu_world = None
         self.pending_text = self.executor.submit(
             self.deepseek.parse,
             self.pending_retry_text,
@@ -714,18 +902,221 @@ class GameApp:
         self.selected_ids = {int(self.world.units.entity_id[index]) for index in indices}
         self._message(f"已选择第 {group} 组：{len(indices)} 人。", self.theme.ink)
 
+    def _select_kind(self, kind: UnitKind) -> None:
+        if self.world is None or self.scene != "battle":
+            return
+        indices = self.world.resolve_selection(
+            SelectionV1(unit_kind=kind.config_name), Faction.PLAYER
+        )
+        self.selected_ids = {int(self.world.units.entity_id[index]) for index in indices}
+        labels = {
+            UnitKind.COMMANDER: "将领",
+            UnitKind.ENGINEER: "工兵",
+            UnitKind.SCOUT: "侦察兵",
+            UnitKind.RECRUIT: "预备兵",
+        }
+        self._message(
+            f"已选择全部{labels.get(kind, kind.config_name)}：{len(indices)} 人。", self.theme.ink
+        )
+
+    def _select_all_player(self) -> None:
+        if self.world is None or self.scene != "battle":
+            return
+        indices = self.world.units.active(Faction.PLAYER)
+        self.selected_ids = {int(self.world.units.entity_id[index]) for index in indices}
+        self._message(f"已选择全军：{len(indices)} 人。", self.theme.ink)
+
     def _move_commander(self, key: int) -> None:
         if self.world is None:
             return
         index = self.world.commander_index(Faction.PLAYER)
         if index is None:
             return
-        dx = -90 if key == pygame.K_LEFT else 90 if key == pygame.K_RIGHT else 0
-        dy = -90 if key == pygame.K_UP else 90 if key == pygame.K_DOWN else 0
+        dx = -64 if key == pygame.K_LEFT else 64 if key == pygame.K_RIGHT else 0
+        dy = -64 if key == pygame.K_UP else 64 if key == pygame.K_DOWN else 0
         x = self.world.units.x[index] / self.world.subpixels + dx
         y = self.world.units.y[index] / self.world.subpixels + dy
         self._issue_move(
             (int(self.world.units.entity_id[index]),), x, y, False, False, CommandSource.KEYBOARD
+        )
+
+    def _request_zoom(self, factor: float, anchor: tuple[int, int] | None = None) -> None:
+        if self.camera is None:
+            return
+        anchor = anchor or BATTLE_RECT.center
+        self.camera.zoom_anchor_screen = anchor
+        self.camera.zoom_anchor_world = self.camera.screen_to_world(*anchor)
+        base = self.camera.target_zoom
+        self.camera.target_zoom = float(np.clip(base * factor, 0.18, 1.5))
+
+    def _update_camera_zoom(self, dt: float) -> None:
+        if self.camera is None or self.world is None:
+            return
+        difference = self.camera.target_zoom - self.camera.zoom
+        if abs(difference) < 0.0005:
+            self.camera.zoom = self.camera.target_zoom
+            self.camera.zoom_anchor_world = None
+            return
+        amount = 1.0 if self.reduced_motion else 1.0 - math.exp(-14.0 * dt)
+        self.camera.zoom += difference * amount
+        if self.camera.zoom_anchor_world is not None:
+            after_x, after_y = self.camera.screen_to_world(*self.camera.zoom_anchor_screen)
+            self.camera.x += self.camera.zoom_anchor_world[0] - after_x
+            self.camera.y += self.camera.zoom_anchor_world[1] - after_y
+        self.camera.clamp(self.world)
+
+    def _camera_from_minimap(self, point: tuple[int, int]) -> None:
+        if self.camera is None or self.world is None:
+            return
+        ratio_x = float(np.clip((point[0] - MINIMAP_RECT.left) / MINIMAP_RECT.width, 0, 1))
+        ratio_y = float(np.clip((point[1] - MINIMAP_RECT.top) / MINIMAP_RECT.height, 0, 1))
+        self.camera.x = ratio_x * self.world.map.width
+        self.camera.y = ratio_y * self.world.map.height
+        self.camera.zoom_anchor_world = None
+        self.camera.clamp(self.world)
+
+    def _open_context_menu(self, point: tuple[int, int]) -> None:
+        if self.camera is None:
+            return
+        self.context_menu_point = point
+        self.context_menu_world = self.camera.screen_to_world(*point)
+
+    def _known_terrain_at(self, x: float, y: float) -> Terrain | None:
+        """Read terrain through the player's observation without exposing hidden cells."""
+        if self.world is None:
+            return None
+        observation = self.world.observation(Faction.PLAYER)
+        known = np.frombuffer(observation.known_terrain, dtype=np.uint8).reshape(
+            observation.terrain_shape
+        )
+        col = int(np.clip(x // self.world.map.tile_size, 0, self.world.map.cols - 1))
+        row = int(np.clip(y // self.world.map.tile_size, 0, self.world.map.rows - 1))
+        value = int(known[row, col])
+        return None if value == 255 else Terrain(value)
+
+    def _context_selection(self, x: float, y: float, minimum: int = 0) -> tuple[int, ...]:
+        if self.world is None:
+            return ()
+        world = self.world
+        selected: list[int] = []
+        for entity_id in sorted(self.selected_ids):
+            index = world.units.index_of(entity_id)
+            if (
+                index is not None
+                and world.units.alive[index]
+                and world.units.faction[index] == int(Faction.PLAYER)
+                and world.units.kind[index] == int(UnitKind.ENGINEER)
+            ):
+                selected.append(entity_id)
+        if len(selected) >= minimum:
+            return tuple(selected)
+        engineers = world.resolve_selection(SelectionV1(unit_kind="engineer"), Faction.PLAYER)
+        ordered = sorted(
+            engineers,
+            key=lambda index: (
+                (world.units.x[index] / world.subpixels - x) ** 2
+                + (world.units.y[index] / world.subpixels - y) ** 2
+            ),
+        )
+        return tuple(int(world.units.entity_id[index]) for index in ordered[:minimum])
+
+    def _issue_context_move(self, attack: bool = False) -> None:
+        if self.context_menu_world is None or self.world is None:
+            return
+        x, y = self.context_menu_world
+        ids = tuple(sorted(self.selected_ids))
+        if not ids:
+            commander = self.world.commander_index(Faction.PLAYER)
+            ids = (int(self.world.units.entity_id[commander]),) if commander is not None else ()
+        self._issue_move(ids, x, y, attack, False, CommandSource.MOUSE)
+        self.context_menu_point = None
+        self.context_menu_world = None
+
+    def _issue_context_build(
+        self, facility_kind: Literal["bridge", "boat", "road", "tower"]
+    ) -> None:
+        if self.context_menu_world is None or self.world is None:
+            return
+        x, y = self.context_menu_world
+        minimum = int(self.world.balance.facilities[facility_kind]["minimum_engineers"])
+        ids = self._context_selection(x, y, minimum)
+        command = CommandEnvelopeV1(
+            command_id=uuid.uuid4().hex,
+            faction=Faction.PLAYER,
+            issued_tick=self.world.tick,
+            source=CommandSource.MOUSE,
+            payload=BuildPayloadV1(
+                selection=SelectionV1(unit_ids=ids),
+                facility_kind=facility_kind,
+                target=PositionV1(x=x, y=y),
+            ),
+        )
+        result = self.world.execute(command)
+        if result.status == CommandStatus.ACCEPTED:
+            self.selected_ids = set(ids)
+            self.sounds.play("command")
+        self._message(
+            result.message_zh,
+            self.theme.success if result.status == CommandStatus.ACCEPTED else self.theme.enemy,
+        )
+        self.context_menu_point = None
+        self.context_menu_world = None
+
+    def _issue_context_recruit(self, village_id: int) -> None:
+        if self.world is None:
+            return
+        first_id = self.world.next_entity_id
+        command = CommandEnvelopeV1(
+            command_id=uuid.uuid4().hex,
+            faction=Faction.PLAYER,
+            issued_tick=self.world.tick,
+            source=CommandSource.MOUSE,
+            payload=RecruitPayloadV1(village_id=village_id, count=20),
+        )
+        result = self.world.execute(command)
+        if result.status == CommandStatus.ACCEPTED:
+            self.selected_ids = set(range(first_id, self.world.next_entity_id))
+            self.sounds.play("command")
+        self._message(
+            result.message_zh
+            + (
+                " 已选中新兵，请在底栏训练兵种。" if result.status == CommandStatus.ACCEPTED else ""
+            ),
+            self.theme.success if result.status == CommandStatus.ACCEPTED else self.theme.enemy,
+        )
+        self.context_menu_point = None
+        self.context_menu_world = None
+
+    def _convert_selected(
+        self, unit_kind: Literal["infantry", "scout", "engineer", "assassin"]
+    ) -> None:
+        if self.world is None or self.scene != "battle":
+            return
+        recruit_ids: list[int] = []
+        for entity_id in sorted(self.selected_ids):
+            index = self.world.units.index_of(entity_id)
+            if (
+                index is not None
+                and self.world.units.alive[index]
+                and self.world.units.faction[index] == int(Faction.PLAYER)
+                and self.world.units.kind[index] == int(UnitKind.RECRUIT)
+            ):
+                recruit_ids.append(entity_id)
+        command = CommandEnvelopeV1(
+            command_id=uuid.uuid4().hex,
+            faction=Faction.PLAYER,
+            issued_tick=self.world.tick,
+            source=CommandSource.MOUSE,
+            payload=ConvertPayloadV1(
+                selection=SelectionV1(unit_ids=tuple(recruit_ids)), unit_kind=unit_kind
+            ),
+        )
+        result = self.world.execute(command)
+        if result.status == CommandStatus.ACCEPTED:
+            self.sounds.play("command")
+        self._message(
+            result.message_zh,
+            self.theme.success if result.status == CommandStatus.ACCEPTED else self.theme.enemy,
         )
 
     def _mouse_order(self, point: tuple[int, int], attack: bool, append: int) -> None:
@@ -802,16 +1193,6 @@ class GameApp:
         result = self.world.execute(command)
         if result.status == CommandStatus.ACCEPTED:
             self.sounds.play("command")
-            # River crossing warning
-            indices = [self.world.units.index_of(eid) for eid in ids]
-            valid = [i for i in indices if i is not None]
-            if valid:
-                loss = self.world._crossing_loss_estimate(np.array(valid), x, y)
-                if loss > 10:
-                    self._message(
-                        f"⚠ 途经河流，预计 HP 损失约 {loss:.0f}",
-                        self.theme.warning,
-                    )
         self._message(
             result.message_zh,
             self.theme.success if result.status == CommandStatus.ACCEPTED else self.theme.enemy,
@@ -850,10 +1231,19 @@ class GameApp:
     def _update(self, dt: float) -> None:
         if self.scene not in {"battle", "replay"} or self.world is None or self.camera is None:
             return
+        self._update_camera_zoom(dt)
+        self._update_battle_effects(dt)
+        if self.result_cinematic_time > 0:
+            self._update_result_cinematic(dt)
+            return
         keys = pygame.key.get_pressed()
         camera_speed = 900 * dt / max(self.camera.zoom, 0.1)
-        self.camera.x += (keys[pygame.K_d] - keys[pygame.K_a]) * camera_speed
-        self.camera.y += (keys[pygame.K_s] - keys[pygame.K_w]) * camera_speed
+        horizontal = keys[pygame.K_d] - keys[pygame.K_a]
+        vertical = keys[pygame.K_s] - keys[pygame.K_w]
+        if horizontal or vertical:
+            self.camera.zoom_anchor_world = None
+        self.camera.x += horizontal * camera_speed
+        self.camera.y += vertical * camera_speed
         self.camera.clamp(self.world)
         self._poll_workers()
         if self.paused or self.help_open:
@@ -871,6 +1261,13 @@ class GameApp:
                 if self.ai is not None and self.ai.ready(self.world.tick):
                     for command in self.ai.decide(self.world.observation(Faction.ENEMY)):
                         self.world.execute(command)
+                if (
+                    self.auto_command
+                    and self.player_ai is not None
+                    and self.player_ai.ready(self.world.tick)
+                ):
+                    for command in self.player_ai.decide(self.world.observation(Faction.PLAYER)):
+                        self.world.execute(command)
                 self.world.step()
                 if self.recorder is not None:
                     self.recorder.update(self.world)
@@ -881,18 +1278,62 @@ class GameApp:
             self.accumulator = 0.0
         self._consume_events()
         if self.scene == "battle" and self.world.outcome != GameOutcome.ONGOING:
-            self.scene = "result"
-            self.paused = True
-            if not self.result_sound_played:
-                self.sounds.play(
-                    "victory" if self.world.outcome == GameOutcome.PLAYER_WIN else "impact"
-                )
-                self.result_sound_played = True
-            if self.recorder is not None:
-                try:
-                    self.save_manager.save_replay(self.recorder.finish(self.world))
-                except OSError:
-                    logger.warning("回放保存失败", exc_info=True)
+            self._begin_result_cinematic()
+
+    def _update_battle_effects(self, dt: float) -> None:
+        if not self.battle_effects:
+            return
+        for effect in self.battle_effects:
+            effect.age += dt
+        self.battle_effects = [
+            effect for effect in self.battle_effects if effect.age < effect.duration
+        ][-96:]
+
+    def _begin_result_cinematic(self) -> None:
+        if self.world is None or self.result_cinematic_time > 0 or self.scene != "battle":
+            return
+        self.paused = True
+        self.context_menu_point = None
+        self.context_menu_world = None
+        commander_deaths = [
+            event
+            for event in reversed(self.world.events)
+            if event.kind == "unit_died" and bool(event.payload.get("commander"))
+        ]
+        if commander_deaths:
+            payload = commander_deaths[0].payload
+            self.cinematic_target = (float(payload["x"]), float(payload["y"]))
+        self.result_cinematic_time = 0.08 if self.reduced_motion else self.result_cinematic_duration
+        if (
+            self.camera is not None
+            and self.cinematic_target is not None
+            and not self.reduced_motion
+        ):
+            self.camera.zoom_anchor_world = None
+            self.camera.target_zoom = max(self.camera.target_zoom, 0.68)
+
+    def _update_result_cinematic(self, dt: float) -> None:
+        if self.world is None or self.camera is None:
+            return
+        if self.cinematic_target is not None and not self.reduced_motion:
+            amount = 1.0 - math.exp(-5.5 * dt)
+            self.camera.x += (self.cinematic_target[0] - self.camera.x) * amount
+            self.camera.y += (self.cinematic_target[1] - self.camera.y) * amount
+            self.camera.clamp(self.world)
+        self.result_cinematic_time = max(0.0, self.result_cinematic_time - dt)
+        if self.result_cinematic_time > 0:
+            return
+        self.scene = "result"
+        if not self.result_sound_played:
+            self.sounds.play(
+                "victory" if self.world.outcome == GameOutcome.PLAYER_WIN else "impact"
+            )
+            self.result_sound_played = True
+        if self.recorder is not None:
+            try:
+                self.save_manager.save_replay(self.recorder.finish(self.world))
+            except OSError:
+                logger.warning("回放保存失败", exc_info=True)
 
     def _poll_workers(self) -> None:
         if self.world is None:
@@ -956,6 +1397,78 @@ class GameApp:
         for event in self.world.visible_events(Faction.PLAYER, self.last_event_index):
             impact |= event.kind == "unit_died"
             completed |= event.kind == "facility_completed"
+            if event.kind == "combat_exchange":
+                target_x = float(event.payload.get("target_x", 0.0))
+                target_y = float(event.payload.get("target_y", 0.0))
+                if self._world_point_visible(target_x, target_y):
+                    attacker_x = float(event.payload.get("attacker_x", target_x))
+                    attacker_y = float(event.payload.get("attacker_y", target_y))
+                    ranged = bool(event.payload.get("ranged"))
+                    tactic = int(event.payload.get("tactic", 0))
+                    self._append_effect(
+                        BattleEffect(
+                            "projectile" if ranged else "charge" if tactic == 2 else "slash",
+                            attacker_x,
+                            attacker_y,
+                            target_x,
+                            target_y,
+                            0.20 if ranged else 0.28,
+                            size=28 if tactic != 2 else 36,
+                        )
+                    )
+                    self._append_effect(
+                        BattleEffect(
+                            "impact", target_x, target_y, target_x, target_y, 0.24, size=24
+                        )
+                    )
+            elif event.kind == "unit_died":
+                x = float(event.payload.get("x", 0.0))
+                y = float(event.payload.get("y", 0.0))
+                if self._world_point_visible(x, y):
+                    commander = bool(event.payload.get("commander"))
+                    self._append_effect(
+                        BattleEffect(
+                            "death",
+                            x,
+                            y,
+                            x,
+                            y,
+                            1.05 if commander else 0.52,
+                            size=72 if commander else 34,
+                            faction=int(event.payload.get("faction", 0)),
+                        )
+                    )
+            elif event.kind == "tactic_started":
+                effect_kind = "sprint" if event.payload.get("kind") == "sprint" else "charge"
+                for entity_id in list(event.payload.get("unit_ids", []))[::3]:
+                    index = self.world.units.index_of(int(entity_id))
+                    if index is None:
+                        continue
+                    x = float(self.world.units.x[index]) / self.world.subpixels
+                    y = float(self.world.units.y[index]) / self.world.subpixels
+                    if self._world_point_visible(x, y):
+                        self._append_effect(BattleEffect(effect_kind, x, y, x, y, 0.42, size=30))
+            elif event.kind == "facility_completed":
+                facility_id = int(event.payload.get("facility_id", -1))
+                facility = next(
+                    (item for item in self.world.facilities if item.facility_id == facility_id),
+                    None,
+                )
+                if facility is not None and self._world_point_visible(facility.x, facility.y):
+                    self._append_effect(
+                        BattleEffect(
+                            "impact",
+                            facility.x,
+                            facility.y,
+                            facility.x,
+                            facility.y,
+                            0.48,
+                            size=40,
+                        )
+                    )
+            elif event.kind == "tower_garrisoned":
+                count = int(event.payload.get("count", 0))
+                self._message(f"{count} 名工兵已登塔并转为守塔弓箭手。", self.theme.success)
         self.stats = {
             "player_losses": self.world.statistics["losses"][int(Faction.PLAYER)],
             "enemy_losses": self.world.statistics["losses"][int(Faction.ENEMY)],
@@ -965,6 +1478,23 @@ class GameApp:
         elif impact:
             self.sounds.play("impact")
         self.last_event_index = len(self.world.events)
+
+    def _append_effect(self, effect: BattleEffect) -> None:
+        if self.reduced_motion and effect.kind not in {"death", "impact"}:
+            return
+        self.battle_effects.append(effect)
+        if len(self.battle_effects) > 96:
+            self.battle_effects = self.battle_effects[-96:]
+
+    def _world_point_visible(self, x: float, y: float) -> bool:
+        if self.world is None or self.view_faction is None:
+            return True
+        fog = self.world._perception
+        if fog is None:
+            return False
+        col = int(np.clip(x // self.world.map.tile_size, 0, self.world.map.cols - 1))
+        row = int(np.clip(y // self.world.map.tile_size, 0, self.world.map.rows - 1))
+        return bool(fog.explored[int(self.view_faction), row, col])
 
     def _message(self, text: str, color: tuple[int, int, int]) -> None:
         self.messages.append((text, color))
@@ -982,6 +1512,8 @@ class GameApp:
 
     def _draw(self) -> None:
         self._mouse_pos = self._logical_mouse(pygame.mouse.get_pos())
+        self._native_text = self._viewport().size != LOGICAL_SIZE
+        self._text_commands = []
         self.canvas.fill(self.theme.background)
         self.buttons = []
         if self.scene == "menu":
@@ -998,12 +1530,8 @@ class GameApp:
                 self._draw_result()
 
     def _draw_menu(self) -> None:
-        title = self.fonts.get(34, True).render("指挥官战术对抗", True, self.theme.ink)
-        subtitle = self.fonts.get(16).render(
-            "在战争迷雾中，以军令统筹一千名真实士兵", True, self.theme.muted
-        )
-        self.canvas.blit(title, (96, 92))
-        self.canvas.blit(subtitle, (98, 142))
+        self._blit_text("指挥官战术对抗", 96, 92, 34, self.theme.ink, True)
+        self._blit_text("在战争迷雾中，以军令统筹一千名真实士兵", 98, 142, 16, self.theme.muted)
         pygame.draw.line(self.canvas, self.theme.primary, (98, 182), (470, 182), 3)
         labels: list[tuple[str, Callable[[], None], bool]] = [
             ("开始对局", self.open_setup, True),
@@ -1050,7 +1578,7 @@ class GameApp:
         briefing = [
             "胜利条件：击杀敌方将领",
             "将领由四名护卫优先承伤",
-            "侦察兵开图并发现未暴露刺客",
+            "侦察兵永久擦除迷雾并发现未暴露刺客",
             "工兵可以架桥、开路、造船与建塔",
             "敌我双方拥有完全独立的战争迷雾",
             "同一模拟帧双方将领阵亡时判为平局",
@@ -1138,7 +1666,9 @@ class GameApp:
                     )
         diff_label = {"easy": "简单", "normal": "普通", "hard": "困难"}[self.setup_difficulty]
         inspire = "可使用鼓舞" if self.setup_difficulty == "hard" else "不使用鼓舞"
-        self._blit_text(f"敌方 AI：{diff_label} · 相同兵力 · {inspire}", 138, 520, 14, self.theme.muted)
+        self._blit_text(
+            f"敌方 AI：{diff_label} · 相同兵力 · {inspire}", 138, 520, 14, self.theme.muted
+        )
         self._draw_action_button(
             pygame.Rect(780, 610, 190, 42), "返回", lambda: setattr(self, "scene", "menu")
         )
@@ -1193,6 +1723,13 @@ class GameApp:
             15,
             self.theme.muted,
         )
+        self._blit_text(
+            "像素战场最近邻缩放 · 文字按显示器分辨率原生重绘",
+            102,
+            158,
+            13,
+            self.theme.muted,
+        )
         panel = pygame.Rect(100, 190, 1080, 390)
         pygame.draw.rect(self.canvas, self.theme.surface, panel, border_radius=10)
         rows = [
@@ -1213,7 +1750,7 @@ class GameApp:
             ),
             (
                 "窗口模式",
-                "全屏" if self.fullscreen else "窗口化",
+                "全屏 · 自动适配" if self.fullscreen else "窗口化 · 自动适配",
                 self._toggle_fullscreen,
             ),
             (
@@ -1256,16 +1793,16 @@ class GameApp:
             (
                 "01 · 观察战场",
                 [
-                    "WASD 或按住中键拖动摄像机，滚轮缩放。",
-                    "黑色区域尚未探索；灰暗区域只保留历史地形。",
-                    "敌军一旦离开当前视野就会消失，小地图遵守同一情报边界。",
+                    "WASD 或按住中键拖动摄像机；滚轮和 + / − 按钮平滑缩放。",
+                    "黑色区域尚未探索；走过的区域会永久擦除战争迷雾。",
+                    "敌军进入任意已探索区域就会显示，小地图遵守同一情报边界。",
                 ],
             ),
             (
                 "02 · 选择与编队",
                 [
-                    "左键点选或拖动框选部队，右键下达移动命令。",
-                    "按住 A 再右键为攻击移动；Shift 追加任务。",
+                    "左键点选或拖动框选部队，右键打开地形操作菜单。",
+                    "菜单可移动、攻击移动；河面可架桥，陆地可建塔。",
                     "Ctrl+数字保存编队，数字键重新选择；方向键直接移动将领。",
                 ],
             ),
@@ -1274,7 +1811,7 @@ class GameApp:
                 [
                     "侦察兵速度快、视野广，并能发现未暴露刺客。",
                     "接近无敌军争夺的村庄后，可用文字命令征召人口。",
-                    "选择足量工兵后，可架桥、造船、开路或建塔；F1 查看句式。",
+                    "陆军不能强行渡河；选择足量工兵架桥后才能通过。",
                 ],
             ),
             (
@@ -1323,7 +1860,7 @@ class GameApp:
         )
 
     def _cycle_ui_scale(self) -> None:
-        values = (1.0, 1.25, 1.5, 2.0)
+        values = (0.9, 1.0, 1.1, 1.2, 1.35)
         current = min(range(len(values)), key=lambda index: abs(values[index] - self.fonts.scale))
         self.fonts.scale = values[(current + 1) % len(values)]
         self.fonts.cache.clear()
@@ -1349,13 +1886,64 @@ class GameApp:
             self.online_enabled = not self.online_enabled
 
     def _toggle_fullscreen(self) -> None:
+        if not self.fullscreen:
+            self._windowed_size = self.screen.get_size()
         self.fullscreen = not self.fullscreen
-        base_flags = pygame.FULLSCREEN if self.fullscreen else pygame.RESIZABLE
-        if self._scaled_mode:
-            self.screen = pygame.display.set_mode(LOGICAL_SIZE, base_flags | pygame.SCALED)
-        else:
-            self.screen = pygame.display.set_mode(LOGICAL_SIZE, base_flags)
+        self.screen = self._set_display_mode(self.fullscreen)
         self._save_settings()
+
+    def _begin_text_input(self) -> None:
+        if self.scene != "battle":
+            return
+        self.typing = True
+        self.command_input = ""
+        self.composition = ""
+        self._refresh_suggestions()
+        if hasattr(pygame.key, "start_text_input"):
+            self._update_ime_rect()
+            pygame.key.start_text_input()
+
+    def _toggle_pause(self) -> None:
+        self.help_open = False
+        self.paused = not self.paused
+
+    def _cycle_speed(self) -> None:
+        values = (0.5, 1.0, 2.0, 4.0)
+        current = min(range(len(values)), key=lambda i: abs(values[i] - self.speed))
+        self.speed = values[(current + 1) % len(values)]
+
+    def _toggle_auto_command(self) -> None:
+        if self.scene != "battle" or self.player_ai is None:
+            return
+        self.auto_command = not self.auto_command
+        state = "开启" if self.auto_command else "关闭"
+        self._message(f"自动作战已{state}；手动指令仍可随时接管。", self.theme.warning)
+
+    def _cycle_view(self) -> None:
+        if self.scene != "replay":
+            return
+        values: tuple[Faction | None, ...] = (Faction.PLAYER, Faction.ENEMY, None)
+        current = values.index(self.view_faction) if self.view_faction in values else 0
+        self.view_faction = values[(current + 1) % len(values)]
+
+    def _quick_save(self) -> None:
+        if self.world is None or self.scene != "battle":
+            return
+        try:
+            path = self.save_manager.save(self.world)
+            self._message(f"已保存：{path.name}", self.theme.success)
+        except OSError as exc:
+            self._message(f"保存失败：{exc}", self.theme.enemy)
+
+    def _choose_ambiguity(self, index: int) -> None:
+        if self.world is None or index >= len(self.ambiguity_candidates):
+            return
+        command = self.ambiguity_candidates[index]
+        self.ambiguity_candidates = []
+        result = self.world.execute(command)
+        self._remember_group_name(command, result)
+        self._message(result.message_zh, self.theme.success)
+        self.sounds.play("command")
 
     def _save_settings(self) -> None:
         self.settings = SettingsV1(
@@ -1395,14 +1983,49 @@ class GameApp:
         self._blit_text(label, rect.centerx, rect.centery, 15, self.theme.ink, True, center=True)
         self.buttons.append(Button(rect, label, action, enabled=True))
 
+    def _draw_compact_button(
+        self,
+        rect: pygame.Rect,
+        label: str,
+        action: Callable[[], None],
+        accent: bool = False,
+        enabled: bool = True,
+    ) -> None:
+        hovered = rect.collidepoint(self._mouse_pos) and enabled
+        fill = (
+            self.theme.primary_hover
+            if hovered
+            else self.theme.primary
+            if accent and enabled
+            else self.theme.surface_high
+        )
+        pygame.draw.rect(self.canvas, fill, rect, border_radius=5)
+        pygame.draw.rect(self.canvas, self.theme.border, rect, 1, border_radius=5)
+        self._blit_text(
+            label,
+            rect.centerx,
+            rect.centery,
+            12,
+            self.theme.ink if enabled else self.theme.muted,
+            accent,
+            center=True,
+            max_width=rect.width - 8,
+        )
+        self.buttons.append(Button(rect, label, action, enabled))
+
     def _draw_battle(self) -> None:
         if self.world is None or self.camera is None:
             return
         pygame.draw.rect(self.canvas, self.theme.fog_unknown, BATTLE_RECT)
         self._draw_terrain()
         self._draw_facilities_and_villages()
+        self._draw_movement_effects()
         self._draw_units()
+        self._draw_battle_effects()
+        if self.result_cinematic_time > 0:
+            self._draw_result_cinematic()
         self._draw_hud()
+        self._draw_context_menu()
         if self.drag_start and pygame.mouse.get_pressed()[0]:
             end = self._mouse_pos
             rect = pygame.Rect(
@@ -1414,8 +2037,135 @@ class GameApp:
             pygame.draw.rect(self.canvas, self.theme.ally, rect, 1)
         if self.help_open:
             self._draw_help()
-        elif self.paused and self.scene == "battle":
+        elif self.paused and self.scene == "battle" and self.result_cinematic_time <= 0:
             self._draw_pause()
+
+    def _draw_context_menu(self) -> None:
+        if (
+            self.context_menu_point is None
+            or self.context_menu_world is None
+            or self.world is None
+            or self.scene != "battle"
+        ):
+            return
+        world_x, world_y = self.context_menu_world
+        terrain = self._known_terrain_at(world_x, world_y)
+        terrain_names = {
+            Terrain.PLAIN: "平原",
+            Terrain.GRASS: "草地",
+            Terrain.FOREST: "森林",
+            Terrain.SWAMP: "沼泽",
+            Terrain.RIVER: "河流",
+            Terrain.ROAD: "道路",
+        }
+        engineers = len(
+            self.world.resolve_selection(SelectionV1(unit_kind="engineer"), Faction.PLAYER)
+        )
+        observation = self.world.observation(Faction.PLAYER)
+        village = next(
+            (
+                item
+                for item in observation.known_villages
+                if (float(item["x"]) - world_x) ** 2 + (float(item["y"]) - world_y) ** 2 <= 92**2
+            ),
+            None,
+        )
+        options: list[tuple[str, Callable[[], None], bool, bool]] = [
+            ("移动到这里", self._issue_context_move, True, True),
+            ("攻击移动", partial(self._issue_context_move, True), True, False),
+        ]
+        if village is not None:
+            options.append(
+                (
+                    "征召预备兵 · 20人",
+                    partial(self._issue_context_recruit, int(village["village_id"])),
+                    int(village["population"]) > 0,
+                    False,
+                )
+            )
+        if terrain == Terrain.RIVER:
+            minimum = int(self.world.balance.facilities["bridge"]["minimum_engineers"])
+            geometry = self.world.known_bridge_geometry_at(Faction.PLAYER, world_x, world_y)
+            if geometry is None:
+                options.append(
+                    (
+                        "架桥 · 需先探明两岸",
+                        partial(self._issue_context_build, "bridge"),
+                        False,
+                        False,
+                    )
+                )
+            else:
+                bridge_length = geometry[2]
+                baseline = self.world.map.tile_size * 7
+                bridge_work = round(
+                    float(self.world.balance.facilities["bridge"]["work"])
+                    * float(np.clip(bridge_length / baseline, 0.75, 3.0))
+                )
+                options.append(
+                    (
+                        f"架桥 · {minimum}人 · 跨{bridge_length:.0f} · 工程{bridge_work}",
+                        partial(self._issue_context_build, "bridge"),
+                        engineers >= minimum,
+                        False,
+                    )
+                )
+        elif terrain is not None and terrain != Terrain.SWAMP:
+            minimum = int(self.world.balance.facilities["tower"]["minimum_engineers"])
+            options.append(
+                (
+                    f"建造防御塔 · {minimum}人",
+                    partial(self._issue_context_build, "tower"),
+                    engineers >= minimum,
+                    False,
+                )
+            )
+            if terrain == Terrain.FOREST:
+                road_minimum = int(self.world.balance.facilities["road"]["minimum_engineers"])
+                options.append(
+                    (
+                        f"开辟道路 · {road_minimum}人",
+                        partial(self._issue_context_build, "road"),
+                        engineers >= road_minimum,
+                        False,
+                    )
+                )
+
+        width = 246
+        height = 38 + len(options) * 36 + 8
+        x = int(
+            np.clip(
+                self.context_menu_point[0] + 8, BATTLE_RECT.left + 6, BATTLE_RECT.right - width - 6
+            )
+        )
+        y = int(
+            np.clip(
+                self.context_menu_point[1] + 8,
+                BATTLE_RECT.top + 6,
+                BATTLE_RECT.bottom - height - 6,
+            )
+        )
+        panel = pygame.Rect(x, y, width, height)
+        pygame.draw.rect(self.canvas, self.theme.surface, panel, border_radius=8)
+        pygame.draw.rect(self.canvas, self.theme.border, panel, 1, border_radius=8)
+        heading = (
+            f"村庄 · 人口 {int(village['population'])}"
+            if village is not None
+            else f"{terrain_names[terrain]} · {world_x:.0f}, {world_y:.0f}"
+            if terrain is not None
+            else f"未探索区域 · {world_x:.0f}, {world_y:.0f}"
+        )
+        self._blit_text(
+            heading,
+            panel.x + 12,
+            panel.y + 10,
+            12,
+            self.theme.muted,
+            max_width=panel.width - 24,
+        )
+        for index, (label, action, enabled, accent) in enumerate(options):
+            rect = pygame.Rect(panel.x + 8, panel.y + 36 + index * 36, panel.width - 16, 30)
+            self._draw_compact_button(rect, label, action, accent, enabled)
 
     def _draw_terrain(self) -> None:
         assert self.world is not None and self.camera is not None
@@ -1427,70 +2177,107 @@ class GameApp:
         if view is not None:
             assert fog is not None
 
-        # Check if cached terrain is still valid
-        cam_key = (
-            round(self.camera.x, 1),
-            round(self.camera.y, 1),
-            round(self.camera.zoom, 3),
+        world_key = (id(self.world.map), self.world.map.revision)
+        if self._terrain_world_key != world_key or self._terrain_world_surface is None:
+            composed = self.art.compose_terrain(self.world.map.terrain)
+            if composed is None:
+                colors = np.asarray(
+                    [
+                        self.theme.terrain_plain,
+                        self.theme.terrain_grass,
+                        self.theme.terrain_forest,
+                        self.theme.terrain_swamp,
+                        self.theme.terrain_river,
+                        self.theme.terrain_road,
+                    ],
+                    dtype=np.uint8,
+                )
+                pixels = colors[self.world.map.terrain]
+                tiny = pygame.surfarray.make_surface(np.transpose(pixels, (1, 0, 2)))
+                composed = pygame.transform.scale(
+                    tiny, (self.world.map.cols * 16, self.world.map.rows * 16)
+                )
+            self._terrain_world_surface = composed
+            self._terrain_world_key = world_key
+            self._fogged_world_surface = None
+            self._terrain_cache = None
+
+        fog_key = (
+            world_key,
             int(view) if view is not None else -1,
-            self.world.tick // 10,  # fog updates every 10 ticks
+            self.world.tick // 10 if view is not None else -1,
+        )
+        if self._fogged_world_key != fog_key:
+            if view is None:
+                self._fogged_world_surface = None
+            else:
+                assert fog is not None
+                fog_mask = pygame.Surface(
+                    (self.world.map.cols, self.world.map.rows), pygame.SRCALPHA
+                )
+                alpha = pygame.surfarray.pixels_alpha(fog_mask)
+                alpha[:, :] = np.where(fog.explored[int(view)].T, 0, 255)
+                del alpha
+                self._fogged_world_surface = fog_mask
+            self._fogged_world_key = fog_key
+            self._terrain_cache = None
+
+        cam_key = (
+            round(self.camera.x, 2),
+            round(self.camera.y, 2),
+            round(self.camera.zoom, 4),
+            fog_key,
         )
         if self._terrain_cache_key == cam_key and self._terrain_cache is not None:
             self.canvas.blit(self._terrain_cache, BATTLE_RECT.topleft)
             return
 
-        colors = np.array([
-            self.theme.terrain_plain,
-            self.theme.terrain_grass,
-            self.theme.terrain_forest,
-            self.theme.terrain_swamp,
-            self.theme.terrain_river,
-            self.theme.terrain_road,
-        ], dtype=np.uint8)
+        view_width = BATTLE_RECT.width / self.camera.zoom
+        view_height = BATTLE_RECT.height / self.camera.zoom
+        left = self.camera.x - view_width / 2
+        top = self.camera.y - view_height / 2
+        right = left + view_width
+        bottom = top + view_height
+        clipped_left = max(0.0, left)
+        clipped_top = max(0.0, top)
+        clipped_right = min(float(self.world.map.width), right)
+        clipped_bottom = min(float(self.world.map.height), bottom)
 
-        tile = self.world.map.tile_size
-        left, top = self.camera.screen_to_world(BATTLE_RECT.left, BATTLE_RECT.top)
-        right, bottom = self.camera.screen_to_world(BATTLE_RECT.right, BATTLE_RECT.bottom)
-        c0 = max(0, int(left // tile))
-        c1 = min(self.world.map.cols, int(right // tile) + 2)
-        r0 = max(0, int(top // tile))
-        r1 = min(self.world.map.rows, int(bottom // tile) + 2)
-        size = max(1, math.ceil(tile * self.camera.zoom) + 1)
+        result = pygame.Surface(BATTLE_RECT.size)
+        result.fill(self.theme.fog_unknown)
+        if clipped_right > clipped_left and clipped_bottom > clipped_top:
+            assert self._terrain_world_surface is not None
+            scale_x = self._terrain_world_surface.get_width() / self.world.map.width
+            scale_y = self._terrain_world_surface.get_height() / self.world.map.height
+            source = pygame.Rect(
+                round(clipped_left * scale_x),
+                round(clipped_top * scale_y),
+                max(1, round((clipped_right - clipped_left) * scale_x)),
+                max(1, round((clipped_bottom - clipped_top) * scale_y)),
+            ).clip(self._terrain_world_surface.get_rect())
+            target = pygame.Rect(
+                round((clipped_left - left) * self.camera.zoom),
+                round((clipped_top - top) * self.camera.zoom),
+                max(1, round((clipped_right - clipped_left) * self.camera.zoom)),
+                max(1, round((clipped_bottom - clipped_top) * self.camera.zoom)),
+            )
+            crop = self._terrain_world_surface.subsurface(source)
+            result.blit(pygame.transform.scale(crop, target.size), target)
+            if self._fogged_world_surface is not None:
+                fog_scale_x = self._fogged_world_surface.get_width() / self.world.map.width
+                fog_scale_y = self._fogged_world_surface.get_height() / self.world.map.height
+                fog_source = pygame.Rect(
+                    int(clipped_left * fog_scale_x),
+                    int(clipped_top * fog_scale_y),
+                    max(1, math.ceil((clipped_right - clipped_left) * fog_scale_x)),
+                    max(1, math.ceil((clipped_bottom - clipped_top) * fog_scale_y)),
+                ).clip(self._fogged_world_surface.get_rect())
+                fog_crop = self._fogged_world_surface.subsurface(fog_source)
+                result.blit(pygame.transform.scale(fog_crop, target.size), target)
 
-        # Build pixel buffer
-        w = BATTLE_RECT.width
-        h = BATTLE_RECT.height
-        buf = np.full((w, h, 3), self.theme.fog_unknown, dtype=np.uint8)
-
-        for row in range(r0, r1):
-            for col in range(c0, c1):
-                sx, sy = self.camera.world_to_screen(col * tile, row * tile)
-                px, py = int(sx - BATTLE_RECT.left), int(sy - BATTLE_RECT.top)
-                if px + size < 0 or py + size < 0 or px >= w or py >= h:
-                    continue
-                if view is None:
-                    color = colors[int(self.world.map.terrain[row, col])]
-                else:
-                    assert fog is not None
-                    if not fog.explored[int(view), row, col]:
-                        continue  # leave as fog_unknown
-                    color = colors[int(self.world.map.terrain[row, col])]
-                    if not fog.visible[int(view), row, col]:
-                        color = np.array([
-                            max(2, color[0] // 3),
-                            max(2, color[1] // 3),
-                            max(2, color[2] // 3),
-                        ], dtype=np.uint8)
-                x1 = max(0, px)
-                y1 = max(0, py)
-                x2 = min(w, px + size)
-                y2 = min(h, py + size)
-                buf[x1:x2, y1:y2] = color
-
-        surface = pygame.surfarray.make_surface(buf)
-        self._terrain_cache = surface
+        self._terrain_cache = result
         self._terrain_cache_key = cam_key
-        self.canvas.blit(surface, BATTLE_RECT.topleft)
+        self.canvas.blit(result, BATTLE_RECT.topleft)
 
     def _draw_facilities_and_villages(self) -> None:
         assert self.world is not None and self.camera is not None
@@ -1514,14 +2301,35 @@ class GameApp:
                 continue
             sx, sy = self.camera.world_to_screen(village.x, village.y)
             radius = max(3, round(village.radius * self.camera.zoom))
-            pygame.draw.circle(self.canvas, self.theme.warning, (sx, sy), radius, 1)
+            village_size = max(24, min(92, round(village.radius * 2.4 * self.camera.zoom)))
+            village_sprite = self.art.village(village_size)
+            if village_sprite is not None:
+                self.canvas.blit(village_sprite, village_sprite.get_rect(center=(sx, sy - 2)))
+                pygame.draw.ellipse(
+                    self.canvas,
+                    self.theme.warning,
+                    pygame.Rect(sx - radius, sy - max(3, radius // 2), radius * 2, radius),
+                    1,
+                )
+            else:
+                pygame.draw.circle(self.canvas, self.theme.warning, (sx, sy), radius, 1)
             if self.camera.zoom > 0.35:
                 population = (
                     village.population
                     if view is None
                     else int(known_villages.get(village.village_id, {}).get("population", 0))
                 )
-                self._blit_text(str(population), sx, sy - 4, 11, self.theme.warning, center=True)
+                label = pygame.Rect(sx - 18, sy + radius + 2, 36, 16)
+                pygame.draw.rect(self.canvas, self.theme.background, label, border_radius=3)
+                self._blit_text(
+                    str(population),
+                    label.centerx,
+                    label.centery,
+                    10,
+                    self.theme.warning,
+                    True,
+                    center=True,
+                )
         for item in self.world.facilities:
             if view is not None and item.facility_id not in known_facility_ids:
                 continue
@@ -1529,9 +2337,28 @@ class GameApp:
             if not BATTLE_RECT.collidepoint(sx, sy):
                 continue
             color = self.theme.ally if item.faction == 0 else self.theme.enemy
+            facility_sprite: pygame.Surface | None = None
+            if item.kind == "bridge":
+                bridge_length = item.bridge_length or self.world.map.tile_size * 8
+                facility_sprite = self.art.facility(
+                    "bridge",
+                    max(30, round(bridge_length * self.camera.zoom)),
+                    max(14, round(BRIDGE_DECK_HALF_WIDTH * 2 * self.camera.zoom)),
+                    vertical=item.bridge_vertical,
+                )
+            elif item.kind == "tower":
+                tower_size = max(18, round(62 * self.camera.zoom))
+                facility_sprite = self.art.facility("tower", tower_size, tower_size)
             if item.destroyed:
                 pygame.draw.line(self.canvas, color, (sx - 6, sy - 6), (sx + 6, sy + 6), 2)
                 pygame.draw.line(self.canvas, color, (sx + 6, sy - 6), (sx - 6, sy + 6), 2)
+            elif facility_sprite is not None:
+                if not item.complete:
+                    facility_sprite = facility_sprite.copy()
+                    facility_sprite.set_alpha(120)
+                self.canvas.blit(facility_sprite, facility_sprite.get_rect(center=(sx, sy)))
+                outline = facility_sprite.get_rect(center=(sx, sy)).inflate(4, 4)
+                pygame.draw.rect(self.canvas, color, outline, 1, border_radius=3)
             else:
                 pygame.draw.rect(
                     self.canvas, color, (sx - 5, sy - 5, 10, 10), 0 if item.complete else 1
@@ -1549,6 +2376,96 @@ class GameApp:
                 if occupants:
                     self._blit_text(str(occupants), sx, sy - 14, 10, color, True, center=True)
 
+    def _draw_unit_tactical_marker(
+        self,
+        sx: int,
+        sy: int,
+        radius: int,
+        kind: UnitKind,
+        faction_color: tuple[int, int, int],
+    ) -> None:
+        """Draw a role-specific marker used while detail sprites fade in."""
+        outline = self.theme.background
+        if self.camera is not None and self.camera.zoom < 0.34:
+            if kind == UnitKind.INFANTRY:
+                pygame.draw.rect(
+                    self.canvas,
+                    faction_color,
+                    (sx - radius, sy - radius, radius * 2, radius * 2),
+                )
+            elif kind == UnitKind.SCOUT:
+                pygame.draw.polygon(
+                    self.canvas,
+                    faction_color,
+                    (
+                        (sx, sy - radius),
+                        (sx + radius, sy + radius),
+                        (sx - radius, sy + radius),
+                    ),
+                )
+            elif kind == UnitKind.ENGINEER:
+                pygame.draw.polygon(
+                    self.canvas,
+                    faction_color,
+                    (
+                        (sx, sy - radius),
+                        (sx + radius, sy),
+                        (sx, sy + radius),
+                        (sx - radius, sy),
+                    ),
+                )
+            elif kind == UnitKind.ASSASSIN:
+                pygame.draw.circle(self.canvas, faction_color, (sx, sy), radius, 1)
+            elif kind == UnitKind.COMMANDER:
+                pygame.draw.circle(self.canvas, self.theme.warning, (sx, sy), radius + 2)
+                pygame.draw.circle(self.canvas, faction_color, (sx, sy), radius - 1)
+            else:
+                pygame.draw.circle(self.canvas, faction_color, (sx, sy), radius)
+            return
+        if kind == UnitKind.INFANTRY:
+            marker = pygame.Rect(sx - radius, sy - radius, radius * 2, radius * 2)
+            pygame.draw.rect(self.canvas, outline, marker.inflate(2, 2), border_radius=2)
+            pygame.draw.rect(self.canvas, faction_color, marker, border_radius=2)
+        elif kind == UnitKind.SCOUT:
+            triangle_points = (
+                (sx, sy - radius - 1),
+                (sx + radius + 1, sy + radius),
+                (sx - radius - 1, sy + radius),
+            )
+            pygame.draw.polygon(self.canvas, outline, triangle_points)
+            inner = tuple(
+                (round(sx + (px - sx) * 0.72), round(sy + (py - sy) * 0.72))
+                for px, py in triangle_points
+            )
+            pygame.draw.polygon(self.canvas, faction_color, inner)
+        elif kind == UnitKind.ENGINEER:
+            diamond_points = (
+                (sx, sy - radius - 1),
+                (sx + radius + 1, sy),
+                (sx, sy + radius + 1),
+                (sx - radius - 1, sy),
+            )
+            pygame.draw.polygon(self.canvas, outline, diamond_points)
+            pygame.draw.polygon(self.canvas, faction_color, diamond_points, 2)
+            pygame.draw.circle(self.canvas, faction_color, (sx, sy), 2)
+        elif kind == UnitKind.ASSASSIN:
+            pygame.draw.circle(self.canvas, outline, (sx, sy), radius + 1)
+            pygame.draw.circle(self.canvas, faction_color, (sx, sy), radius, 2)
+            pygame.draw.circle(self.canvas, faction_color, (sx, sy), 2)
+        elif kind == UnitKind.COMMANDER:
+            pygame.draw.circle(self.canvas, outline, (sx, sy), radius + 3)
+            pygame.draw.circle(self.canvas, self.theme.warning, (sx, sy), radius + 2)
+            pygame.draw.circle(self.canvas, faction_color, (sx, sy), radius - 1)
+        elif kind == UnitKind.GUARD:
+            pygame.draw.circle(self.canvas, outline, (sx, sy), radius + 1)
+            pygame.draw.circle(self.canvas, faction_color, (sx, sy), radius)
+            pygame.draw.line(
+                self.canvas, self.theme.ink, (sx, sy - radius + 1), (sx, sy + radius - 1), 1
+            )
+        else:
+            pygame.draw.circle(self.canvas, outline, (sx, sy), radius + 1)
+            pygame.draw.circle(self.canvas, faction_color, (sx, sy), radius)
+
     def _draw_units(self) -> None:
         assert self.world is not None and self.camera is not None
         view = self.view_faction
@@ -1561,13 +2478,6 @@ class GameApp:
             for item in self.world.facilities
             if item.complete and item.kind in {"tower", "boat"}
         }
-        # Per-unit-kind colors
-        kind_colors = {
-            UnitKind.INFANTRY: (220, 60, 60),     # red
-            UnitKind.SCOUT: (70, 130, 230),       # blue
-            UnitKind.ENGINEER: (230, 200, 50),    # yellow
-            UnitKind.ASSASSIN: (170, 80, 220),    # purple
-        }
         for index in self.world.units.active():
             if int(self.world.units.facility_id[index]) in concealed_facilities:
                 continue
@@ -1575,7 +2485,11 @@ class GameApp:
             faction = int(self.world.units.faction[index])
             if view is not None and faction != int(view) and entity_id not in visible_enemy_ids:
                 continue
-            alpha = 1.0 if self.reduced_motion else float(np.clip(self.accumulator / self.world.dt, 0, 1))
+            alpha = (
+                1.0
+                if self.reduced_motion
+                else float(np.clip(self.accumulator / self.world.dt, 0, 1))
+            )
             x = (
                 self.world.units.previous_x[index] * (1 - alpha) + self.world.units.x[index] * alpha
             ) / self.world.subpixels
@@ -1586,56 +2500,517 @@ class GameApp:
             if not BATTLE_RECT.collidepoint(sx, sy):
                 continue
             kind = UnitKind(int(self.world.units.kind[index]))
-            radius = max(2, min(7, round(self.world.units.radius[index] * self.camera.zoom + 1)))
-            color = kind_colors.get(kind, self.theme.ally if faction == 0 else self.theme.enemy)
+            faction_color = self.theme.ally if faction == int(Faction.PLAYER) else self.theme.enemy
+            radius = max(3, min(9, round(self.world.units.radius[index] * self.camera.zoom + 2)))
+            detail_mix = float(np.clip((self.camera.zoom - 0.42) / 0.16, 0.0, 1.0))
+            sprite_size = min(
+                50,
+                round(
+                    14
+                    + max(0.0, self.camera.zoom - 0.42) * 48
+                    + (5 if kind in {UnitKind.COMMANDER, UnitKind.GUARD} else 0)
+                ),
+            )
+            sprite = self.art.unit(faction, int(kind), sprite_size) if detail_mix > 0.0 else None
+            if detail_mix < 1.0:
+                self._draw_unit_tactical_marker(sx, sy, radius, kind, faction_color)
+            if sprite is not None:
+                shadow_radius = max(4, round(sprite_size * 0.22))
+                shadow = pygame.Surface((shadow_radius * 2 + 2, shadow_radius + 4), pygame.SRCALPHA)
+                pygame.draw.ellipse(shadow, (20, 22, 20, round(92 * detail_mix)), shadow.get_rect())
+                self.canvas.blit(shadow, shadow.get_rect(center=(sx, sy + sprite_size // 3)))
+                if detail_mix < 1.0:
+                    sprite = sprite.copy()
+                    sprite.set_alpha(round(255 * detail_mix))
+                sprite_rect = sprite.get_rect(center=(sx, sy - sprite_size // 10))
+                self.canvas.blit(sprite, sprite_rect)
             if kind == UnitKind.COMMANDER:
-                color = self.theme.warning
-            # Enemy black halo
-            if faction == 1:
-                pygame.draw.circle(self.canvas, (0, 0, 0), (sx, sy), radius + 3)
-            if kind == UnitKind.COMMANDER:
-                pygame.draw.circle(self.canvas, self.theme.warning, (sx, sy), radius + 4, 2)
-            if faction == 0:
-                pygame.draw.circle(self.canvas, color, (sx, sy), radius)
-                pygame.draw.line(
-                    self.canvas,
-                    self.theme.background,
-                    (sx, sy - radius),
-                    (sx + radius, sy - radius),
-                    1,
-                )
-            else:
-                pygame.draw.polygon(
-                    self.canvas,
-                    color,
-                    [
-                        (sx, sy - radius - 1),
-                        (sx + radius + 1, sy),
-                        (sx, sy + radius + 1),
-                        (sx - radius - 1, sy),
-                    ],
-                )
+                pygame.draw.circle(self.canvas, self.theme.warning, (sx, sy), radius + 5, 2)
             if entity_id in self.selected_ids:
-                pygame.draw.circle(self.canvas, self.theme.ink, (sx, sy), radius + 4, 1)
+                selection_radius = max(radius + 4, sprite_size // 2 if sprite is not None else 0)
+                pygame.draw.circle(self.canvas, self.theme.ink, (sx, sy), selection_radius, 1)
             if (
                 self.world.units.hp[index] < self.world.units.max_hp[index]
                 and self.camera.zoom > 0.4
             ):
                 ratio = float(self.world.units.hp[index] / self.world.units.max_hp[index])
-                pygame.draw.rect(
-                    self.canvas, self.theme.background, (sx - 7, sy - radius - 5, 14, 2)
-                )
+                health_y = sy - (sprite_size // 2 + 5 if sprite is not None else radius + 5)
+                pygame.draw.rect(self.canvas, self.theme.background, (sx - 7, health_y, 14, 2))
                 pygame.draw.rect(
                     self.canvas,
                     self.theme.success if ratio > 0.4 else self.theme.enemy,
-                    (sx - 7, sy - radius - 5, round(14 * ratio), 2),
+                    (sx - 7, health_y, round(14 * ratio), 2),
                 )
 
+    def _draw_movement_effects(self) -> None:
+        assert self.world is not None and self.camera is not None
+        if self.reduced_motion or self.camera.zoom < 0.26:
+            return
+        layer = pygame.Surface(BATTLE_RECT.size, pygame.SRCALPHA)
+        view = self.view_faction
+        observation = self.world.observation(view) if view is not None else None
+        visible_enemy_ids = (
+            {unit.entity_id for unit in observation.visible_enemies} if observation else set()
+        )
+        for index in self.world.units.active():
+            tactic = int(self.world.units.tactic_kind[index])
+            if tactic == 0:
+                continue
+            entity_id = int(self.world.units.entity_id[index])
+            faction = int(self.world.units.faction[index])
+            if view is not None and faction != int(view) and entity_id not in visible_enemy_ids:
+                continue
+            if entity_id % 3:
+                continue
+            x = float(self.world.units.x[index]) / self.world.subpixels
+            y = float(self.world.units.y[index]) / self.world.subpixels
+            previous_x = float(self.world.units.previous_x[index]) / self.world.subpixels
+            previous_y = float(self.world.units.previous_y[index]) / self.world.subpixels
+            dx, dy = x - previous_x, y - previous_y
+            length = math.hypot(dx, dy)
+            if length < 0.02:
+                continue
+            sx, sy = self.camera.world_to_screen(x, y)
+            if not BATTLE_RECT.collidepoint(sx, sy):
+                continue
+            nx, ny = dx / length, dy / length
+            trail = 9 if tactic == 1 else 13
+            color = (*self.theme.ally, 105) if tactic == 1 else (*self.theme.warning, 125)
+            local = (sx - BATTLE_RECT.x, sy - BATTLE_RECT.y)
+            for offset in (-2, 2):
+                perpendicular_x, perpendicular_y = -ny * offset, nx * offset
+                start = (
+                    round(local[0] - nx * trail + perpendicular_x),
+                    round(local[1] - ny * trail + perpendicular_y),
+                )
+                end = (
+                    round(local[0] - nx * 2 + perpendicular_x),
+                    round(local[1] - ny * 2 + perpendicular_y),
+                )
+                pygame.draw.line(layer, color, start, end, 1)
+            if entity_id % 12 == 0:
+                sprite = self.art.effect("sprint" if tactic == 1 else "charge", 22)
+                if sprite is not None:
+                    sprite = sprite.copy()
+                    sprite.set_alpha(72)
+                    layer.blit(sprite, sprite.get_rect(center=local))
+        self.canvas.blit(layer, BATTLE_RECT.topleft)
+
+    def _draw_battle_effects(self) -> None:
+        if self.camera is None or not self.battle_effects:
+            return
+        layer = pygame.Surface(BATTLE_RECT.size, pygame.SRCALPHA)
+        for effect in self.battle_effects:
+            progress = float(np.clip(effect.age / max(effect.duration, 0.001), 0, 1))
+            alpha = round(255 * (1.0 - progress))
+            if effect.kind == "projectile":
+                eased = 1.0 - (1.0 - progress) ** 3
+                x = effect.x + (effect.target_x - effect.x) * eased
+                y = effect.y + (effect.target_y - effect.y) * eased
+                sx, sy = self.camera.world_to_screen(x, y)
+                tx, ty = self.camera.world_to_screen(effect.x, effect.y)
+                local = (sx - BATTLE_RECT.x, sy - BATTLE_RECT.y)
+                tail = (
+                    round(local[0] + (tx - sx) * 0.12),
+                    round(local[1] + (ty - sy) * 0.12),
+                )
+                pygame.draw.line(layer, (244, 214, 137, alpha), tail, local, 2)
+                pygame.draw.circle(layer, (255, 249, 220, alpha), local, 2)
+                continue
+            x = effect.x + (effect.target_x - effect.x) * 0.72
+            y = effect.y + (effect.target_y - effect.y) * 0.72
+            sx, sy = self.camera.world_to_screen(x, y)
+            if not BATTLE_RECT.inflate(80, 80).collidepoint(sx, sy):
+                continue
+            local = (sx - BATTLE_RECT.x, sy - BATTLE_RECT.y)
+            art_kind = "impact" if effect.kind == "death" else effect.kind
+            size = max(8, round(effect.size * (0.76 + progress * 0.42)))
+            sprite = self.art.effect(art_kind, size)
+            if sprite is not None:
+                sprite = sprite.copy()
+                sprite.set_alpha(alpha)
+                layer.blit(sprite, sprite.get_rect(center=local))
+            else:
+                fallback = self.theme.enemy if effect.kind == "death" else self.theme.warning
+                pygame.draw.circle(layer, (*fallback, alpha), local, max(2, size // 4), 2)
+            if effect.kind == "death":
+                ring_color = self.theme.enemy if effect.faction == 0 else self.theme.ally
+                pygame.draw.circle(
+                    layer,
+                    (*ring_color, alpha),
+                    local,
+                    max(5, round(size * 0.46)),
+                    2,
+                )
+        self.canvas.blit(layer, BATTLE_RECT.topleft)
+
+    def _draw_result_cinematic(self) -> None:
+        assert self.world is not None and self.camera is not None
+        overlay = pygame.Surface(BATTLE_RECT.size, pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 58))
+        self.canvas.blit(overlay, BATTLE_RECT.topleft)
+        if self.cinematic_target is not None:
+            sx, sy = self.camera.world_to_screen(*self.cinematic_target)
+            pulse = 24 + round(8 * math.sin(self.result_cinematic_time * 11))
+            pygame.draw.circle(self.canvas, self.theme.warning, (sx, sy), pulse, 2)
+            pygame.draw.circle(self.canvas, self.theme.ink, (sx, sy), pulse + 5, 1)
+        labels = {
+            GameOutcome.PLAYER_WIN: ("敌方将领阵亡", self.theme.success),
+            GameOutcome.ENEMY_WIN: ("我方将领阵亡", self.theme.enemy),
+            GameOutcome.DRAW: ("双方将领同时阵亡", self.theme.warning),
+        }
+        label, color = labels[self.world.outcome]
+        banner = pygame.Rect(BATTLE_RECT.centerx - 150, BATTLE_RECT.top + 22, 300, 42)
+        pygame.draw.rect(self.canvas, self.theme.surface, banner, border_radius=6)
+        pygame.draw.rect(self.canvas, color, banner, 2, border_radius=6)
+        self._blit_text(label, banner.centerx, banner.centery, 18, color, True, center=True)
+
     def _draw_hud(self) -> None:
+        assert self.world is not None
+        topbar = pygame.Rect(0, 0, 1280, 40)
+        right_rail = pygame.Rect(960, 40, 320, 680)
+        order_deck = pygame.Rect(0, 588, 960, 132)
+        pygame.draw.rect(self.canvas, self.theme.surface, topbar)
+        pygame.draw.rect(self.canvas, self.theme.surface, right_rail)
+        pygame.draw.rect(self.canvas, self.theme.surface, order_deck)
+        pygame.draw.line(self.canvas, self.theme.border, (0, 39), (1280, 39), 1)
+        pygame.draw.line(self.canvas, self.theme.border, (959, 40), (959, 720), 1)
+        pygame.draw.line(self.canvas, self.theme.border, (0, 588), (960, 588), 1)
+
+        # Top status strip: one scan line for time, simulation and global controls.
+        pygame.draw.rect(self.canvas, self.theme.warning, (12, 9, 3, 22))
+        self._blit_text("前线指挥部", 24, 20, 15, self.theme.ink, True, center_y=True)
+        minutes, seconds = divmod(self.world.tick // self.world.balance.world.simulation_hz, 60)
+        self._blit_text(
+            f"{minutes:02d}:{seconds:02d}", 136, 20, 14, self.theme.warning, True, center_y=True
+        )
+        self._blit_text(
+            "已暂停" if self.paused else f"战局 {self.speed:g}×",
+            202,
+            20,
+            13,
+            self.theme.warning if self.paused else self.theme.ink,
+            True,
+            center_y=True,
+        )
+        online_ready = self.online_enabled and self.deepseek.available
+        pygame.draw.circle(
+            self.canvas, self.theme.success if online_ready else self.theme.muted, (292, 20), 4
+        )
+        self._blit_text(
+            "在线军令" if online_ready else "离线军令",
+            304,
+            20,
+            12,
+            self.theme.muted,
+            center_y=True,
+        )
+        p95 = float(np.percentile(self.tick_timings, 95)) if self.tick_timings else 0.0
+        self._blit_text(
+            f"FPS {self.clock.get_fps():.0f} · SIM {p95:.1f}ms",
+            402,
+            20,
+            11,
+            self.theme.muted if p95 <= 10 else self.theme.warning,
+            center_y=True,
+            max_width=118,
+        )
+        actions: list[tuple[str, Callable[[], None], int]]
+        if self.scene == "replay":
+            actions = [
+                ("视角", self._cycle_view, 52),
+                (f"{self.speed:g}×", self._cycle_speed, 48),
+                ("暂停" if not self.paused else "继续", self._toggle_pause, 54),
+                ("帮助", lambda: setattr(self, "help_open", True), 50),
+                ("全屏", self._toggle_fullscreen, 50),
+            ]
+        else:
+            actions = [
+                ("暂停" if not self.paused else "继续", self._toggle_pause, 54),
+                (f"{self.speed:g}×", self._cycle_speed, 46),
+                ("自动开" if self.auto_command else "自动关", self._toggle_auto_command, 56),
+                ("军令", self._begin_text_input, 50),
+                ("保存", self._quick_save, 46),
+                ("载入", self.load_battle, 46),
+                ("帮助", lambda: setattr(self, "help_open", True), 46),
+                ("全屏", self._toggle_fullscreen, 46),
+            ]
+        button_x = 530 if self.scene != "replay" else 566
+        for label, action, width in actions:
+            self._draw_compact_button(
+                pygame.Rect(button_x, 5, width, 30),
+                label,
+                action,
+                accent=label in {"继续", "自动开"},
+            )
+            button_x += width + 5
+
+        # Right command rail.
+        commander_panel = pygame.Rect(972, 52, 296, 124)
+        log_panel = pygame.Rect(972, 188, 296, 330)
+        for panel in (commander_panel, log_panel):
+            pygame.draw.rect(self.canvas, self.theme.background, panel, border_radius=8)
+            pygame.draw.rect(self.canvas, self.theme.border, panel, 1, border_radius=8)
+        view = self.view_faction
+        side = view if view is not None else Faction.PLAYER
+        side_label = "我军" if side == Faction.PLAYER else "敌军"
+        self._blit_text(f"{side_label}将领", 988, 68, 15, self.theme.ink, True)
+        commander = self.world.commander_index(side)
+        if commander is None:
+            hp, max_hp = 0.0, 1.0
+        else:
+            hp = float(self.world.units.hp[commander])
+            max_hp = float(self.world.units.max_hp[commander])
+        self._blit_text(
+            "阵亡" if hp <= 0 else "指挥中",
+            1250,
+            69,
+            12,
+            self.theme.enemy if hp <= 0 else self.theme.success,
+            True,
+            center=True,
+        )
+        hp_track = pygame.Rect(988, 94, 264, 8)
+        pygame.draw.rect(self.canvas, self.theme.surface_high, hp_track, border_radius=4)
+        pygame.draw.rect(
+            self.canvas,
+            self.theme.success if hp / max_hp > 0.35 else self.theme.enemy,
+            (
+                hp_track.x,
+                hp_track.y,
+                round(hp_track.width * max(0.0, hp / max_hp)),
+                hp_track.height,
+            ),
+            border_radius=4,
+        )
+        self._blit_text(f"生命 {max(0, round(hp))}/{round(max_hp)}", 988, 111, 11, self.theme.muted)
+        alive = len(self.world.units.active(side))
+        known_enemy = (
+            len(self.world.observation(side).visible_enemies)
+            if view is not None
+            else len(self.world.units.active(Faction.ENEMY))
+        )
+        guards = int(
+            np.sum(
+                self.world.units.alive[: self.world.units.count]
+                & (self.world.units.faction[: self.world.units.count] == int(side))
+                & (self.world.units.kind[: self.world.units.count] == int(UnitKind.GUARD))
+            )
+        )
+        self._blit_text(f"兵力 {alive}", 988, 141, 13, self.theme.ally, True)
+        self._blit_text(f"敌情 {known_enemy}", 1078, 141, 13, self.theme.enemy, True)
+        self._blit_text(f"护卫 {guards}/4", 1170, 141, 13, self.theme.warning, True)
+
+        self._blit_text("指挥记录", 988, 204, 15, self.theme.ink, True)
+        self._blit_text("最新战场反馈", 1162, 205, 10, self.theme.muted, max_width=90)
+        pygame.draw.line(self.canvas, self.theme.border, (988, 228), (1252, 228), 1)
+        history_lines = 6 if self.ambiguity_candidates else 10
+        visible_messages = self.messages[-history_lines:]
+        for line, (message, color) in enumerate(visible_messages):
+            row_y = 238 + line * 27
+            pygame.draw.circle(self.canvas, color, (990, row_y + 7), 3)
+            self._blit_text(message, 1001, row_y, 11, self.theme.ink, max_width=251)
+        if self.ambiguity_candidates:
+            self._blit_text("请选择命令解释", 988, 414, 12, self.theme.warning, True)
+            for index, command in enumerate(self.ambiguity_candidates):
+                payload = command.payload
+                detail: str = payload.kind
+                if isinstance(payload, MovePayloadV1):
+                    detail = (
+                        f"{payload.kind} · 组{payload.selection.group_id}"
+                        if payload.selection.group_id
+                        else f"{payload.kind} · ({payload.target.x:.0f},{payload.target.y:.0f})"
+                    )
+                self._draw_compact_button(
+                    pygame.Rect(986, 438 + index * 25, 268, 22),
+                    f"{index + 1}  {detail}",
+                    partial(self._choose_ambiguity, index),
+                    index == 0,
+                )
+
+        self._draw_minimap()
+        if self.camera is not None:
+            zoom_panel = pygame.Rect(900, 52, 48, 118)
+            pygame.draw.rect(self.canvas, self.theme.surface, zoom_panel, border_radius=6)
+            pygame.draw.rect(self.canvas, self.theme.border, zoom_panel, 1, border_radius=6)
+            self._draw_compact_button(
+                pygame.Rect(907, 59, 34, 32),
+                "+",
+                partial(self._request_zoom, 1.28, BATTLE_RECT.center),
+                True,
+            )
+            self._blit_text(f"{self.camera.zoom:.2f}", 924, 108, 10, self.theme.ink, center=True)
+            self._draw_compact_button(
+                pygame.Rect(907, 131, 34, 32),
+                "−",
+                partial(self._request_zoom, 1 / 1.28, BATTLE_RECT.center),
+            )
+
+        if self.scene == "replay":
+            self._draw_replay_controls()
+            return
+
+        # Bottom order deck: selection at left, command entry at right.
+        selection_panel = pygame.Rect(12, 600, 304, 108)
+        command_panel = pygame.Rect(328, 600, 620, 108)
+        for panel in (selection_panel, command_panel):
+            pygame.draw.rect(self.canvas, self.theme.background, panel, border_radius=8)
+            pygame.draw.rect(self.canvas, self.theme.border, panel, 1, border_radius=8)
+        selected_indices = [self.world.units.index_of(entity_id) for entity_id in self.selected_ids]
+        selected = [
+            index
+            for index in selected_indices
+            if index is not None and self.world.units.alive[index]
+        ]
+        self._blit_text(f"部队选择 · {len(selected)}", 26, 614, 14, self.theme.ink, True)
+        if selected:
+            average_hp = float(
+                np.mean(
+                    [
+                        self.world.units.hp[index] / self.world.units.max_hp[index]
+                        for index in selected
+                    ]
+                )
+            )
+            average_stamina = float(
+                np.mean([self.world.units.stamina[index] for index in selected])
+            )
+            self._blit_text(
+                f"生命 {average_hp * 100:.0f}%  ·  耐力 {average_stamina:.0f}",
+                26,
+                639,
+                11,
+                self.theme.muted,
+            )
+        else:
+            self._blit_text("点选、框选或使用下方快捷选择", 26, 639, 11, self.theme.muted)
+        quick_select: list[tuple[str, Callable[[], None]]] = [
+            ("全军", self._select_all_player),
+            ("将领", partial(self._select_kind, UnitKind.COMMANDER)),
+            ("工兵", partial(self._select_kind, UnitKind.ENGINEER)),
+            ("侦察", partial(self._select_kind, UnitKind.SCOUT)),
+            ("预备", partial(self._select_kind, UnitKind.RECRUIT)),
+        ]
+        for index, (label, action) in enumerate(quick_select):
+            self._draw_compact_button(
+                pygame.Rect(24 + index * 56, 665, 51, 31), label, action, index == 0
+            )
+
+        selected_recruits = [
+            index for index in selected if self.world.units.kind[index] == int(UnitKind.RECRUIT)
+        ]
+        if selected_recruits:
+            self._blit_text(
+                f"训练预备兵 · 已选 {len(selected_recruits)} 人",
+                342,
+                614,
+                13,
+                self.theme.ink,
+                True,
+            )
+            conversion_options: list[
+                tuple[str, Literal["infantry", "scout", "engineer", "assassin"]]
+            ] = [
+                ("训练步兵", "infantry"),
+                ("训练侦察", "scout"),
+                ("训练工兵", "engineer"),
+                ("训练刺客", "assassin"),
+            ]
+            for index, (label, kind) in enumerate(conversion_options):
+                self._draw_compact_button(
+                    pygame.Rect(342 + index * 147, 636, 138, 38),
+                    label,
+                    partial(self._convert_selected, kind),
+                    index == 0,
+                )
+            self._blit_text(
+                "选择预备兵后点击训练；初始预备队和村庄新兵都可转换",
+                342,
+                686,
+                11,
+                self.theme.muted,
+                max_width=590,
+            )
+            return
+
+        self._blit_text("文字军令", 342, 614, 13, self.theme.ink, True)
+        box = pygame.Rect(342, 636, 484, 38)
+        send = pygame.Rect(836, 636, 98, 38)
+        pygame.draw.rect(self.canvas, self.theme.surface, box, border_radius=6)
+        pygame.draw.rect(
+            self.canvas,
+            self.theme.primary if self.typing else self.theme.border,
+            box,
+            2 if self.typing else 1,
+            border_radius=6,
+        )
+        if self.typing:
+            self._blit_text(
+                self.command_input + self.composition + "│",
+                box.x + 12,
+                box.centery,
+                14,
+                self.theme.ink,
+                center_y=True,
+                max_width=box.width - 24,
+            )
+            self._draw_compact_button(send, "执行军令", self._submit_text, True)
+            if self.suggestions:
+                suggestion_height = len(self.suggestions) * 27 + 6
+                suggestion_box = pygame.Rect(
+                    box.x, box.y - suggestion_height - 6, box.width, suggestion_height
+                )
+                pygame.draw.rect(
+                    self.canvas, self.theme.background, suggestion_box, border_radius=6
+                )
+                pygame.draw.rect(self.canvas, self.theme.border, suggestion_box, 1, border_radius=6)
+                for index, text in enumerate(self.suggestions):
+                    option = pygame.Rect(
+                        suggestion_box.x + 3,
+                        suggestion_box.y + 3 + index * 27,
+                        suggestion_box.width - 6,
+                        25,
+                    )
+                    if index == self.selected_suggestion:
+                        pygame.draw.rect(self.canvas, self.theme.primary, option, border_radius=4)
+                    self._blit_text(
+                        text,
+                        option.x + 9,
+                        option.centery,
+                        12,
+                        self.theme.ink,
+                        center_y=True,
+                        max_width=option.width - 18,
+                    )
+                    self.buttons.append(Button(option, text, partial(self._pick_suggestion, index)))
+        else:
+            self._blit_text(
+                "点击输入命令，例如：工兵队在中央架桥",
+                box.x + 12,
+                box.centery,
+                13,
+                self.theme.muted,
+                center_y=True,
+                max_width=box.width - 24,
+            )
+            self.buttons.append(Button(box, "输入文字军令", self._begin_text_input))
+            self._draw_compact_button(send, "输入军令", self._begin_text_input, True)
+        self._blit_text(
+            "左键选择 · 右键行动/建造 · 滚轮缩放 · 中键拖动地图",
+            342,
+            686,
+            11,
+            self.theme.muted,
+            max_width=590,
+        )
+
+    def _draw_hud_legacy(self) -> None:
         assert self.world is not None
         pygame.draw.rect(self.canvas, self.theme.surface, (0, 0, 1280, 40))
         pygame.draw.rect(self.canvas, self.theme.surface, (960, 40, 320, 680))
         pygame.draw.rect(self.canvas, self.theme.surface, (0, 588, 960, 132))
+        pygame.draw.rect(self.canvas, self.theme.surface_high, (972, 52, 296, 134), border_radius=8)
+        pygame.draw.rect(self.canvas, self.theme.background, (972, 200, 296, 326), border_radius=8)
         pygame.draw.line(self.canvas, self.theme.border, (960, 40), (960, 720))
         pygame.draw.line(self.canvas, self.theme.border, (0, 588), (960, 588))
         minutes, seconds = divmod(self.world.tick // self.world.balance.world.simulation_hz, 60)
@@ -1673,13 +3048,62 @@ class GameApp:
             12,
             self.theme.muted if p95 <= 10 else self.theme.warning,
             center_y=True,
+            max_width=245,
         )
-        shortcuts = (
-            "F2/F3/F4 视角   ←/→ 跳转   F11 全屏"
-            if self.scene == "replay"
-            else "F1 指令书   F5 保存   F9 载入   F11 全屏"
-        )
-        self._blit_text(shortcuts, 640, 20, 12, self.theme.muted, center_y=True)
+
+        actions: list[tuple[str, Callable[[], None], int]]
+        if self.scene == "replay":
+            actions = [
+                ("视角", self._cycle_view, 54),
+                (f"{self.speed:g}×", self._cycle_speed, 50),
+                ("暂停" if not self.paused else "继续", self._toggle_pause, 54),
+                ("帮助", lambda: setattr(self, "help_open", True), 50),
+                ("全屏", self._toggle_fullscreen, 50),
+            ]
+        else:
+            actions = [
+                ("暂停" if not self.paused else "继续", self._toggle_pause, 54),
+                (f"{self.speed:g}×", self._cycle_speed, 48),
+                ("军令", self._begin_text_input, 54),
+                ("保存", self._quick_save, 48),
+                ("载入", self.load_battle, 48),
+                ("帮助", lambda: setattr(self, "help_open", True), 46),
+                ("全屏", self._toggle_fullscreen, 46),
+            ]
+        button_x = 572
+        for index, (label, action, width) in enumerate(actions):
+            self._draw_compact_button(
+                pygame.Rect(button_x, 6, width, 28),
+                label,
+                action,
+                accent=index == 0 and self.paused,
+            )
+            button_x += width + 5
+
+        if self.camera is not None:
+            zoom_panel = pygame.Rect(906, 52, 46, 112)
+            pygame.draw.rect(self.canvas, self.theme.surface, zoom_panel, border_radius=7)
+            pygame.draw.rect(self.canvas, self.theme.border, zoom_panel, 1, border_radius=7)
+            self._draw_compact_button(
+                pygame.Rect(913, 59, 32, 30),
+                "+",
+                partial(self._request_zoom, 1.28, BATTLE_RECT.center),
+                True,
+            )
+            self._draw_compact_button(
+                pygame.Rect(913, 124, 32, 30),
+                "−",
+                partial(self._request_zoom, 1 / 1.28, BATTLE_RECT.center),
+            )
+            self._blit_text(
+                f"{self.camera.zoom:.2f}×",
+                zoom_panel.centerx,
+                106,
+                10,
+                self.theme.ink,
+                center=True,
+                max_width=40,
+            )
 
         self._blit_text("战场态势", 980, 64, 18, self.theme.ink, True)
         view = self.view_faction
@@ -1710,8 +3134,7 @@ class GameApp:
         self._blit_text("指挥记录", 980, 212, 17, self.theme.ink, True)
         history_lines = 7 if self.ambiguity_candidates else 12
         for line, (message, color) in enumerate(self.messages[-history_lines:]):
-            clipped = message if len(message) <= 20 else message[:19] + "…"
-            self._blit_text(clipped, 980, 242 + line * 25, 13, color)
+            self._blit_text(message, 980, 242 + line * 25, 13, color, max_width=272)
         if self.ambiguity_candidates:
             self._blit_text("选择解释", 980, 430, 14, self.theme.warning, True)
             for index, command in enumerate(self.ambiguity_candidates):
@@ -1724,6 +3147,10 @@ class GameApp:
                         else f"{payload.kind} · ({payload.target.x:.0f},{payload.target.y:.0f})"
                     )
                 self._blit_text(f"{index + 1}  {detail}", 980, 458 + index * 24, 12, self.theme.ink)
+                option_rect = pygame.Rect(976, 452 + index * 24, 282, 23)
+                self.buttons.append(
+                    Button(option_rect, f"解释 {index + 1}", partial(self._choose_ambiguity, index))
+                )
 
         self._draw_minimap()
 
@@ -1764,15 +3191,29 @@ class GameApp:
             )
         else:
             self._blit_text("左键点选或拖动框选；数字键选择编队。", 20, 650, 14, self.theme.muted)
+        box = pygame.Rect(330, 612, 510, 42)
+        send = pygame.Rect(850, 612, 80, 42)
+        pygame.draw.rect(self.canvas, self.theme.background, box, border_radius=6)
+        pygame.draw.rect(
+            self.canvas,
+            self.theme.primary if self.typing else self.theme.border,
+            box,
+            2 if self.typing else 1,
+            border_radius=6,
+        )
         if self.typing:
-            box = pygame.Rect(340, 618, 590, 42)
-            pygame.draw.rect(self.canvas, self.theme.background, box, border_radius=6)
-            pygame.draw.rect(self.canvas, self.theme.primary, box, 2, border_radius=6)
             self._blit_text(
-                self.command_input + self.composition + "│", box.x + 12, box.centery, 15, self.theme.ink, center_y=True
+                self.command_input + self.composition + "│",
+                box.x + 12,
+                box.centery,
+                15,
+                self.theme.ink,
+                center_y=True,
+                max_width=box.width - 24,
             )
-            hint = "Tab 补全 · ↑↓ 选择 · Enter 执行 · Esc 取消"
-            self._blit_text(hint, 340, 674, 12, self.theme.muted)
+            self._draw_compact_button(send, "执行", self._submit_text, True)
+            hint = "可点击候选或执行；Esc 取消输入"
+            self._blit_text(hint, 330, 672, 12, self.theme.muted, max_width=600)
             # Render suggestions dropdown (above input box)
             if self.suggestions:
                 sug_h = len(self.suggestions) * 26 + 4
@@ -1782,19 +3223,43 @@ class GameApp:
                 for i, text in enumerate(self.suggestions):
                     is_sel = i == self.selected_suggestion
                     if is_sel:
-                        sel_rect = pygame.Rect(sug_box.x + 2, sug_box.y + 2 + i * 26, sug_box.width - 4, 24)
+                        sel_rect = pygame.Rect(
+                            sug_box.x + 2, sug_box.y + 2 + i * 26, sug_box.width - 4, 24
+                        )
                         pygame.draw.rect(self.canvas, self.theme.primary, sel_rect, border_radius=3)
                     color = self.theme.background if is_sel else self.theme.ink
-                    self._blit_text(text, sug_box.x + 10, sug_box.y + 4 + i * 26, 14, color)
+                    option_rect = pygame.Rect(
+                        sug_box.x + 2, sug_box.y + 2 + i * 26, sug_box.width - 4, 24
+                    )
+                    self._blit_text(
+                        text,
+                        sug_box.x + 10,
+                        sug_box.y + 4 + i * 26,
+                        14,
+                        color,
+                        max_width=sug_box.width - 20,
+                    )
+                    self.buttons.append(
+                        Button(option_rect, text, partial(self._pick_suggestion, i))
+                    )
         else:
-            self._blit_text("Enter 输入文字军令 · 按住 V 语音下令", 340, 638, 15, self.theme.ink)
             self._blit_text(
-                "A+右键攻击移动 · Ctrl+数字编组 · Shift 追加", 340, 674, 12, self.theme.muted
+                "点击输入文字军令……", box.x + 12, box.centery, 15, self.theme.muted, center_y=True
+            )
+            self.buttons.append(Button(box, "输入文字军令", self._begin_text_input))
+            self._draw_compact_button(send, "输入", self._begin_text_input, True)
+            self._blit_text(
+                "左键选择 · 右键菜单 · 滚轮缩放 · 拖动缩略图",
+                330,
+                672,
+                12,
+                self.theme.muted,
+                max_width=600,
             )
 
     def _draw_minimap(self) -> None:
         assert self.world is not None and self.camera is not None
-        rect = pygame.Rect(980, 548, 280, 152)
+        rect = MINIMAP_RECT
         view = self.view_faction
         fog = self.world._perception
 
@@ -1816,33 +3281,65 @@ class GameApp:
             pixels = terrain_colors[self.world.map.terrain]
             if view is not None and fog is not None:
                 explored = fog.explored[int(view)]
-                visible = fog.visible[int(view)]
                 pixels = pixels.copy()
                 pixels[~explored] = self.theme.fog_unknown
-                pixels[explored & ~visible] //= 3
             surface = pygame.surfarray.make_surface(np.transpose(pixels, (1, 0, 2)))
             self._minimap_cache = pygame.transform.scale(surface, rect.size)
             self._minimap_cache_key = cache_key
 
+        self._blit_text("缩略图 · 拖动 / 滚轮缩放", rect.x, rect.y - 19, 11, self.theme.muted)
+        self._draw_compact_button(
+            pygame.Rect(1204, rect.y - 27, 24, 23),
+            "+",
+            partial(self._request_zoom, 1.28, BATTLE_RECT.center),
+            True,
+        )
+        self._draw_compact_button(
+            pygame.Rect(1234, rect.y - 27, 24, 23),
+            "−",
+            partial(self._request_zoom, 1 / 1.28, BATTLE_RECT.center),
+        )
         self.canvas.blit(self._minimap_cache, rect)
         observation = self.world.observation(view) if view is not None else None
         visible_ids = (
             {unit.entity_id for unit in observation.visible_enemies} if observation else set()
         )
-        for index in self.world.units.active():
-            faction = int(self.world.units.faction[index])
-            entity_id = int(self.world.units.entity_id[index])
-            if view is not None and faction != int(view) and entity_id not in visible_ids:
-                continue
-            x = self.world.units.x[index] / self.world.subpixels
-            y = self.world.units.y[index] / self.world.subpixels
-            sx = rect.x + round(x / self.world.map.width * rect.width)
-            sy = rect.y + round(y / self.world.map.height * rect.height)
-            position = (
-                int(np.clip(sx, rect.left, rect.right - 1)),
-                int(np.clip(sy, rect.top, rect.bottom - 1)),
+        active = self.world.units.active()
+        if view is not None and len(active):
+            factions = self.world.units.faction[active]
+            entity_ids = self.world.units.entity_id[active]
+            visible_mask = factions == int(view)
+            if visible_ids:
+                visible_mask |= np.isin(entity_ids, np.fromiter(visible_ids, dtype=np.int32))
+            active = active[visible_mask]
+        if len(active):
+            unit_layer = pygame.Surface(rect.size, pygame.SRCALPHA)
+            xs = np.rint(
+                self.world.units.x[active]
+                / self.world.subpixels
+                / self.world.map.width
+                * (rect.width - 1)
+            ).astype(np.int32)
+            ys = np.rint(
+                self.world.units.y[active]
+                / self.world.subpixels
+                / self.world.map.height
+                * (rect.height - 1)
+            ).astype(np.int32)
+            xs = np.clip(xs, 0, rect.width - 1)
+            ys = np.clip(ys, 0, rect.height - 1)
+            factions = self.world.units.faction[active]
+            colors = np.where(
+                (factions == int(Faction.PLAYER))[:, None],
+                np.asarray(self.theme.ally, dtype=np.uint8),
+                np.asarray(self.theme.enemy, dtype=np.uint8),
             )
-            self.canvas.set_at(position, self.theme.ally if faction == 0 else self.theme.enemy)
+            rgb = pygame.surfarray.pixels3d(unit_layer)
+            alpha = pygame.surfarray.pixels_alpha(unit_layer)
+            rgb[xs, ys] = colors
+            alpha[xs, ys] = 255
+            del rgb, alpha
+            self.canvas.blit(unit_layer, rect.topleft)
         world_left, world_top = self.camera.screen_to_world(BATTLE_RECT.left, BATTLE_RECT.top)
         world_right, world_bottom = self.camera.screen_to_world(
             BATTLE_RECT.right, BATTLE_RECT.bottom
@@ -1853,8 +3350,17 @@ class GameApp:
             max(2, round((world_right - world_left) / self.world.map.width * rect.width)),
             max(2, round((world_bottom - world_top) / self.world.map.height * rect.height)),
         )
-        pygame.draw.rect(self.canvas, self.theme.ink, camera_rect.clip(rect), 1)
-        pygame.draw.rect(self.canvas, self.theme.border, rect, 1)
+        clipped_camera = camera_rect.clip(rect)
+        viewport_overlay = pygame.Surface(clipped_camera.size, pygame.SRCALPHA)
+        viewport_overlay.fill((*self.theme.ally, 30))
+        self.canvas.blit(viewport_overlay, clipped_camera)
+        pygame.draw.rect(self.canvas, self.theme.ink, clipped_camera, 2)
+        pygame.draw.rect(
+            self.canvas,
+            self.theme.primary_hover if self.minimap_dragging else self.theme.border,
+            rect,
+            2 if self.minimap_dragging else 1,
+        )
 
     def _draw_replay_controls(self) -> None:
         assert self.world is not None and self.replay_player is not None
@@ -1920,10 +3426,16 @@ class GameApp:
         pygame.draw.rect(self.canvas, self.theme.surface, panel, border_radius=10)
         pygame.draw.rect(self.canvas, self.theme.border, panel, 1, border_radius=10)
         self._blit_text("指令书", panel.centerx, 78, 24, self.theme.ink, True, center=True)
+        self._draw_compact_button(
+            pygame.Rect(panel.right - 88, panel.top + 18, 64, 32),
+            "关闭",
+            lambda: setattr(self, "help_open", False),
+            True,
+        )
 
         left = [
             "选择与移动",
-            "左键点选或框选，右键移动。A+右键攻击移动。",
+            "左键点选或框选；右键打开移动、攻击移动与建造菜单。",
             "Ctrl+1–9 保存编组，1–9 选中编组，Shift 追加选择。",
             "方向键直接移动将领。Space 暂停，-/+ 调整速度。",
             "",
@@ -1966,8 +3478,8 @@ class GameApp:
             "将领：阵亡即败，4名护卫拦截攻击",
             "",
             "其他操作",
-            "Esc 返回 / 暂停  F1 指令书",
-            "F5 保存  F9 载入  V 按住说话",
+            "顶栏按钮可暂停、调速、保存、载入与全屏。",
+            "所有基础界面均可用鼠标操作，键盘只是快捷方式。",
             "Enter 提交命令  Esc 取消输入",
         ]
         self._draw_lines(left, 108, 112, 490)
@@ -1998,20 +3510,29 @@ class GameApp:
         overlay = pygame.Surface(LOGICAL_SIZE, pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 150))
         self.canvas.blit(overlay, (0, 0))
-        panel = pygame.Rect(440, 220, 400, 250)
+        panel = pygame.Rect(400, 190, 480, 330)
         pygame.draw.rect(self.canvas, self.theme.surface, panel, border_radius=10)
-        self._blit_text("战局已暂停", panel.centerx, 264, 24, self.theme.ink, True, center=True)
-        self._blit_text("Esc / Space 继续", panel.centerx, 320, 15, self.theme.muted, center=True)
-        self._blit_text(
-            "F5 保存 · F9 载入 · F11 全屏", panel.centerx, 352, 14, self.theme.muted, center=True
-        )
+        pygame.draw.rect(self.canvas, self.theme.border, panel, 1, border_radius=10)
+        self._blit_text("战局已暂停", panel.centerx, 232, 24, self.theme.ink, True, center=True)
+        options = [
+            ("继续战斗", self._toggle_pause, True),
+            ("保存战局", self._quick_save, False),
+            ("载入存档", self.load_battle, False),
+            ("切换全屏", self._toggle_fullscreen, False),
+            ("返回主菜单", lambda: setattr(self, "scene", "menu"), False),
+        ]
+        for index, (label, action, accent) in enumerate(options):
+            col, row = index % 2, index // 2
+            rect = pygame.Rect(panel.x + 38 + col * 202, 274 + row * 54, 190, 40)
+            self._draw_compact_button(rect, label, action, accent)
         self._blit_text(
             "断网时可继续使用鼠标、键盘和离线文字命令。",
             panel.centerx,
-            408,
+            478,
             13,
             self.theme.ink,
             center=True,
+            max_width=420,
         )
 
     def _draw_result(self) -> None:
@@ -2042,7 +3563,11 @@ class GameApp:
         seconds = int(duration_s) % 60
         self._blit_text(
             f"对局时长 {minutes}分{seconds:02d}秒 · {self.world.tick} 帧",
-            panel.centerx, 164, 15, self.theme.muted, center=True,
+            panel.centerx,
+            164,
+            15,
+            self.theme.muted,
+            center=True,
         )
 
         # Statistics table
@@ -2065,8 +3590,12 @@ class GameApp:
 
         # Kills
         self._blit_text("击杀", 310, y, 14, self.theme.muted)
-        self._blit_text(str(stats.get("kills", [0, 0])[0]), 480, y, 15, self.theme.ink, True, center=True)
-        self._blit_text(str(stats.get("kills", [0, 0])[1]), 620, y, 15, self.theme.ink, True, center=True)
+        self._blit_text(
+            str(stats.get("kills", [0, 0])[0]), 480, y, 15, self.theme.ink, True, center=True
+        )
+        self._blit_text(
+            str(stats.get("kills", [0, 0])[1]), 620, y, 15, self.theme.ink, True, center=True
+        )
         y += 28
 
         # Damage dealt
@@ -2078,8 +3607,13 @@ class GameApp:
 
         # Per-unit-type losses breakdown
         kind_names = {
-            "recruit": "初始兵", "infantry": "步兵", "scout": "侦察兵",
-            "engineer": "工兵", "assassin": "刺客", "commander": "将领", "guard": "护卫",
+            "recruit": "初始兵",
+            "infantry": "步兵",
+            "scout": "侦察兵",
+            "engineer": "工兵",
+            "assassin": "刺客",
+            "commander": "将领",
+            "guard": "护卫",
         }
         losses_by_kind = stats.get("losses_by_kind", [{}, {}])
         has_breakdown = any(losses_by_kind[0]) or any(losses_by_kind[1])
@@ -2135,8 +3669,28 @@ class GameApp:
         bold: bool = False,
         center: bool = False,
         center_y: bool = False,
+        max_width: int | None = None,
     ) -> None:
-        surface = self.fonts.get(size, bold).render(str(text), True, color)
+        value = str(text)
+        font = self.fonts.get(size, bold)
+        if max_width is None and not center and x >= 960:
+            max_width = LOGICAL_SIZE[0] - x - 12
+        if max_width is not None and font.size(value)[0] > max_width:
+            suffix = "…"
+            low, high = 0, len(value)
+            while low < high:
+                middle = (low + high + 1) // 2
+                if font.size(value[:middle] + suffix)[0] <= max_width:
+                    low = middle
+                else:
+                    high = middle - 1
+            value = value[:low] + suffix if low else suffix
+        if self._native_text:
+            self._text_commands.append(
+                TextCommand(value, x, y, size, color, bold, center, center_y)
+            )
+            return
+        surface = self.fonts.render(value, size, color, bold)
         rect = surface.get_rect()
         if center:
             rect.center = (x, y)
@@ -2161,20 +3715,39 @@ class GameApp:
         return result
 
     def _viewport(self) -> pygame.Rect:
-        if self._scaled_mode:
-            return pygame.Rect(0, 0, *LOGICAL_SIZE)
         sw, sh = self.screen.get_size()
         scale = min(sw / LOGICAL_SIZE[0], sh / LOGICAL_SIZE[1])
         width, height = round(LOGICAL_SIZE[0] * scale), round(LOGICAL_SIZE[1] * scale)
         return pygame.Rect((sw - width) // 2, (sh - height) // 2, width, height)
 
     def _present(self) -> None:
-        if self._scaled_mode:
-            self.screen.blit(self.canvas, (0, 0))
-            pygame.display.flip()
+        viewport = self._viewport()
+        self.screen.fill(self.theme.background)
+        if viewport.size == LOGICAL_SIZE:
+            self.screen.blit(self.canvas, viewport.topleft)
         else:
-            viewport = self._viewport()
-            self.screen.fill(self.theme.background)
-            scaled = pygame.transform.smoothscale(self.canvas, viewport.size)
+            # Nearest-neighbour preserves crisp pixel edges without increasing
+            # the pixel-art layer's internal rendering resolution.
+            scaled = pygame.transform.scale(self.canvas, viewport.size)
             self.screen.blit(scaled, viewport)
-            pygame.display.flip()
+        if self._native_text:
+            scale = viewport.width / LOGICAL_SIZE[0]
+            for command in self._text_commands:
+                surface = self.fonts.render(
+                    command.text,
+                    command.size,
+                    command.color,
+                    command.bold,
+                    resolution_scale=scale,
+                )
+                rect = surface.get_rect()
+                px = viewport.x + round(command.x * scale)
+                py = viewport.y + round(command.y * scale)
+                if command.center:
+                    rect.center = (px, py)
+                elif command.center_y:
+                    rect.midleft = (px, py)
+                else:
+                    rect.topleft = (px, py)
+                self.screen.blit(surface, rect)
+        pygame.display.flip()

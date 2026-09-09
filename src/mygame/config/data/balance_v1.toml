@@ -139,8 +139,6 @@ river = 1.0
 road = 1.0
 
 [terrain]
-river_damage_per_second = 8.0
-
 [facilities.bridge]
 work = 600.0
 minimum_engineers = 8

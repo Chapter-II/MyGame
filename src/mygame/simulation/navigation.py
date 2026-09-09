@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import heapq
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
 
+from mygame.constants import BRIDGE_DECK_HALF_WIDTH
 from mygame.maps import BattleMap
 
 
@@ -32,15 +34,40 @@ class FlowFieldCache:
             ],
             dtype=np.float32,
         )
+        self.bridge_mask = np.zeros_like(self.map.terrain, dtype=np.bool_)
         self.cache: dict[tuple[int, int, str, int], FlowField] = {}
+
+    def set_bridges(
+        self,
+        bridges: Sequence[tuple[float, float] | tuple[float, float, float, bool]],
+        radius: float,
+    ) -> None:
+        """Make only the river cells covered by completed bridges passable to land units."""
+        yy, xx = np.indices(self.map.terrain.shape)
+        centers_x = (xx + 0.5) * self.map.tile_size
+        centers_y = (yy + 0.5) * self.map.tile_size
+        mask = np.zeros_like(self.map.terrain, dtype=np.bool_)
+        for bridge in bridges:
+            bridge_x, bridge_y = bridge[0], bridge[1]
+            if len(bridge) == 4:
+                length, vertical = bridge[2], bridge[3]
+                if vertical:
+                    mask |= (np.abs(centers_y - bridge_y) <= length / 2) & (
+                        np.abs(centers_x - bridge_x) <= BRIDGE_DECK_HALF_WIDTH
+                    )
+                else:
+                    mask |= (np.abs(centers_x - bridge_x) <= length / 2) & (
+                        np.abs(centers_y - bridge_y) <= BRIDGE_DECK_HALF_WIDTH
+                    )
+            else:
+                mask |= (centers_x - bridge_x) ** 2 + (centers_y - bridge_y) ** 2 <= radius**2
+        if not np.array_equal(mask, self.bridge_mask):
+            self.bridge_mask = mask
+            self.cache.clear()
 
     def get(self, target_x: float, target_y: float, movement: str = "land") -> FlowField:
         col = int(np.clip(target_x // self.map.tile_size, 0, self.map.cols - 1))
         row = int(np.clip(target_y // self.map.tile_size, 0, self.map.rows - 1))
-        # Nearby formation destinations share one field and one cache entry.
-        region = 8
-        col = min(self.map.cols - 1, col // region * region + region // 2)
-        row = min(self.map.rows - 1, row // region * region + region // 2)
         key = (col, row, movement, self.map.revision)
         field = self.cache.get(key)
         if field is None:
@@ -59,6 +86,10 @@ class FlowFieldCache:
         terrain_cost = 1.0 / np.maximum(self.speed[self.map.terrain], 0.01)
         if movement == "boat":
             terrain_cost = np.where(self.map.terrain == 4, 1.0, 5.0).astype(np.float32)
+        else:
+            blocked_river = (self.map.terrain == 4) & ~self.bridge_mask
+            terrain_cost[blocked_river] = np.inf
+        walkable = np.isfinite(terrain_cost)
         neighbors = (
             (-1, 0, 1.0),
             (1, 0, 1.0),
@@ -76,6 +107,10 @@ class FlowFieldCache:
             for dy, dx, length in neighbors:
                 next_row, next_col = row + dy, col + dx
                 if not (0 <= next_row < rows and 0 <= next_col < cols):
+                    continue
+                if not walkable[next_row, next_col]:
+                    continue
+                if dy and dx and (not walkable[row, next_col] or not walkable[next_row, col]):
                     continue
                 candidate = cost + float(terrain_cost[next_row, next_col]) * length
                 if candidate < integration[next_row, next_col]:
