@@ -12,6 +12,38 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mygame.config import BalanceConfig, UnitStats, load_balance
+from mygame.constants import (
+    ARRIVAL_DISTANCE,
+    BRIDGE_DECK_HALF_WIDTH,
+    BRIDGE_RADIUS,
+    BUILD_PROXIMITY,
+    CHASE_DISTANCE,
+    COLLISION_CELL_SIZE,
+    COLLISION_MAX_PUSH,
+    COLLISION_OVERLAP_FACTOR,
+    COLLISION_PUSH_FACTOR,
+    COMBAT_CELL_SIZE,
+    COMPOSITION_ASSASSIN,
+    COMPOSITION_ENGINEER,
+    COMPOSITION_INFANTRY,
+    COMPOSITION_SCOUT,
+    COMPOSITION_TOTAL,
+    DEFAULT_DESTROYED_BOAT_DAMAGE,
+    DISEMBARK_BASE_RADIUS,
+    DISEMBARK_GROWTH,
+    FACILITY_ATTACK_BUFFER,
+    FACILITY_EJECT_RADIUS,
+    FACILITY_INTERACTION_RADIUS,
+    FORMATION_SPACING,
+    GOLDEN_ANGLE,
+    GUARD_INTERCEPT_DISTANCE,
+    MAX_MELEE_ENGAGEMENTS,
+    MAX_TARGET_SAMPLES,
+    MELEE_RANGE_THRESHOLD,
+    RECRUIT_BASE_RADIUS,
+    RECRUIT_GROWTH,
+    RIVER_ROUTE_SAMPLES,
+)
 from mygame.maps import BattleMap, Terrain, generate_map
 from mygame.protocols import (
     AttackFacilityPayloadV1,
@@ -34,19 +66,6 @@ from mygame.protocols import (
     TacticalPayloadV1,
 )
 from mygame.simulation.navigation import FlowFieldCache
-from mygame.constants import (
-    ARRIVAL_DISTANCE, BRIDGE_RADIUS, BUILD_PROXIMITY, CHASE_DISTANCE,
-    COLLISION_CELL_SIZE, COLLISION_MAX_PUSH, COLLISION_MAX_SAMPLES,
-    COLLISION_OVERLAP_FACTOR, COLLISION_PUSH_FACTOR, COMBAT_CELL_SIZE,
-    COMPOSITION_ASSASSIN, COMPOSITION_ENGINEER, COMPOSITION_INFANTRY,
-    COMPOSITION_SCOUT, COMPOSITION_TOTAL, DEFAULT_DESTROYED_BOAT_DAMAGE,
-    DISEMBARK_BASE_RADIUS, DISEMBARK_GROWTH, FACILITY_ATTACK_BUFFER,
-    FACILITY_EJECT_RADIUS, FACILITY_INTERACTION_RADIUS, FORMATION_SPACING,
-    GOLDEN_ANGLE, GUARD_FOLLOW_OFFSET_X, GUARD_FOLLOW_OFFSET_Y,
-    GUARD_FOLLOW_RESQ, GUARD_INTERCEPT_DISTANCE, MAX_CROSSING_LOSS,
-    MAX_MELEE_ENGAGEMENTS, MAX_TARGET_SAMPLES, MELEE_RANGE_THRESHOLD,
-    RECRUIT_BASE_RADIUS, RECRUIT_GROWTH, RIVER_CROSSING_SAMPLES,
-)
 
 if TYPE_CHECKING:
     from mygame.perception.fog import FogOfWar
@@ -106,6 +125,8 @@ class Facility:
     target_y: float | None = None
     elapsed_ticks: int = 0
     destroyed: bool = False
+    bridge_length: float = 0.0
+    bridge_vertical: bool = False
 
 
 class UnitStore:
@@ -322,7 +343,13 @@ class World:
             "damage_dealt": [0.0, 0.0],
         }
         self.order_queues: dict[int, list[tuple[int, int, int]]] = {}
-        self._flow_fields = FlowFieldCache(self.map, self.balance.terrain_speed)
+        # Each faction gets a route cache containing only bridges it has
+        # discovered. Sharing one global bridge mask would let pathfinding reveal
+        # enemy construction hidden by fog of war.
+        self._flow_fields = {
+            faction: FlowFieldCache(self.map, self.balance.terrain_speed)
+            for faction in (Faction.PLAYER, Faction.ENEMY)
+        }
         self.outcome = GameOutcome.ONGOING
         self.victory_enabled = False
         self.groups: dict[int, dict[int, str]] = {0: {}, 1: {}}
@@ -360,34 +387,43 @@ class World:
             engineers = composition["engineer"]
             assassins = composition["assassin"]
             recruits = composition["recruit"]
-        preset = [
-            (UnitKind.COMMANDER, 1, 0),
-            (UnitKind.GUARD, 4, 0),
-            (UnitKind.INFANTRY, infantry, 1),
-            (UnitKind.SCOUT, scouts, 2),
-            (UnitKind.ENGINEER, engineers, 3),
-            (UnitKind.ASSASSIN, assassins, 4),
-            (UnitKind.RECRUIT, recruits, 5),
+        formations = [
+            (UnitKind.INFANTRY, infantry, 1, 190.0, -440.0),
+            (UnitKind.SCOUT, scouts, 2, 190.0, 0.0),
+            (UnitKind.ENGINEER, engineers, 3, 190.0, 440.0),
+            (UnitKind.ASSASSIN, assassins, 4, -170.0, -225.0),
+            (UnitKind.RECRUIT, recruits, 5, -170.0, 225.0),
         ]
         for faction in (Faction.PLAYER, Faction.ENEMY):
-            kinds: list[tuple[UnitKind, int]] = []
-            for kind, amount, group in preset:
-                kinds.extend((kind, group) for _ in range(amount))
-            base_x = 310.0 if faction == Faction.PLAYER else self.map.width - 310.0
+            base_x = 650.0 if faction == Faction.PLAYER else self.map.width - 650.0
             direction = 1.0 if faction == Faction.PLAYER else -1.0
-            for offset, (kind, group) in enumerate(kinds):
-                if offset == 0:
-                    x, y = base_x - direction * 88.0, self.map.height / 2
-                elif offset < 5:
-                    guard_offset = offset - 1
-                    x = base_x - direction * 60.0
-                    y = self.map.height / 2 + (guard_offset - 1.5) * 22.0
-                else:
-                    row = (offset - 5) // 25
-                    col = (offset - 5) % 25
-                    x = base_x + direction * (col * 15.0)
-                    y = self.map.height / 2 - 150.0 + row * 16.0
-                self.spawn_unit(faction, kind, x, y, group)
+            center_y = self.map.height / 2
+            commander_x = base_x - direction * 390.0
+            self.spawn_unit(faction, UnitKind.COMMANDER, commander_x, center_y, 0)
+            for guard_offset in range(4):
+                self.spawn_unit(
+                    faction,
+                    UnitKind.GUARD,
+                    commander_x + direction * 32.0,
+                    center_y + (guard_offset - 1.5) * 25.0,
+                    0,
+                )
+            for kind, amount, group, x_offset, y_offset in formations:
+                if amount <= 0:
+                    continue
+                files = math.ceil(math.sqrt(amount))
+                ranks = math.ceil(amount / files)
+                spacing = 17.0
+                for number in range(amount):
+                    rank = number // files
+                    file = number % files
+                    x = (
+                        base_x
+                        + direction * x_offset
+                        + direction * (rank - (ranks - 1) / 2) * spacing
+                    )
+                    y = center_y + y_offset + (file - (files - 1) / 2) * spacing
+                    self.spawn_unit(faction, kind, x, y, group)
             self.groups[int(faction)] = {
                 1: "第一战团",
                 2: "第一侦察队",
@@ -519,12 +555,39 @@ class World:
             )
         x = float(np.clip(payload.target.x, 0, self.map.width))
         y = float(np.clip(payload.target.y, 0, self.map.height))
-        crossing_loss = self._crossing_loss_estimate(indices, x, y)
+        target_terrain = self._known_terrain_at(command.faction, x, y)
+        target_is_river = target_terrain == int(Terrain.RIVER)
+        target_bridge = self._known_bridge_at_position(command.faction, x, y)
+        target_on_bridge = target_bridge is not None
+        if target_is_river and not target_on_bridge:
+            return self._result(
+                command,
+                CommandStatus.REJECTED,
+                "river_requires_bridge",
+                "河流不可直接通行，请先架桥并将目的地设在桥上或对岸。",
+            )
+        route_crosses_river, _ = self._route_knowledge(command.faction, indices, x, y)
+        if not self._has_known_complete_bridge(command.faction) and route_crosses_river:
+            return self._result(
+                command,
+                CommandStatus.REJECTED,
+                "river_requires_bridge",
+                "该路线需要渡河，请先命令工兵架桥。",
+            )
         offsets = self._formation_offsets(len(indices), FORMATION_SPACING)
         order = int(Order.ATTACK_MOVE if payload.kind == "attack_move" else Order.MOVE)
         for position, index in enumerate(indices):
-            target_x = round((x + float(offsets[position, 0])) * self.subpixels)
-            target_y = round((y + float(offsets[position, 1])) * self.subpixels)
+            unit_target_x = x + float(offsets[position, 0])
+            unit_target_y = y + float(offsets[position, 1])
+            if target_bridge is not None:
+                unit_target_x, unit_target_y = self._project_to_bridge_deck(
+                    target_bridge,
+                    unit_target_x,
+                    unit_target_y,
+                    float(self.units.radius[index]),
+                )
+            target_x = round(unit_target_x * self.subpixels)
+            target_y = round(unit_target_y * self.subpixels)
             entity_id = int(self.units.entity_id[index])
             if command.queue_mode == QueueMode.APPEND and self.units.order[index] != int(
                 Order.IDLE
@@ -542,8 +605,6 @@ class World:
             f"已向 {len(indices)} 名单位下达"
             f"{'攻击移动' if payload.kind == 'attack_move' else '移动'}指令。"
         )
-        if crossing_loss > 0:
-            message += f" 预计强渡损失约 {crossing_loss:.0f} HP/人；建议架桥或登船。"
         return self._result(
             command,
             CommandStatus.ACCEPTED,
@@ -551,30 +612,193 @@ class World:
             message,
         )
 
-    def _crossing_loss_estimate(
-        self, indices: np.ndarray, target_x: float, target_y: float
-    ) -> float:
-        if any(
-            facility.complete and facility.kind == FacilityKind.BRIDGE
-            for facility in self.facilities
-        ):
-            return 0.0
+    def _has_known_complete_bridge(self, faction: Faction) -> bool:
+        return any(
+            item["kind"] == FacilityKind.BRIDGE
+            and bool(item["complete"])
+            and not bool(item["destroyed"])
+            for item in self.observation(faction).known_facilities
+        )
+
+    def _known_bridge_at_position(self, faction: Faction, x: float, y: float) -> Facility | None:
+        known_ids = {
+            int(item["facility_id"])
+            for item in self.observation(faction).known_facilities
+            if item["kind"] == FacilityKind.BRIDGE
+            and bool(item["complete"])
+            and not bool(item["destroyed"])
+        }
+        bridge = self._bridge_at_position(x, y)
+        return bridge if bridge is not None and bridge.facility_id in known_ids else None
+
+    def _known_terrain(self, faction: Faction) -> np.ndarray:
+        observation = self.observation(faction)
+        return np.frombuffer(observation.known_terrain, dtype=np.uint8).reshape(
+            observation.terrain_shape
+        )
+
+    def _known_terrain_at(self, faction: Faction, x: float, y: float) -> int:
+        known = self._known_terrain(faction)
+        col = int(np.clip(x // self.map.tile_size, 0, self.map.cols - 1))
+        row = int(np.clip(y // self.map.tile_size, 0, self.map.rows - 1))
+        return int(known[row, col])
+
+    def _route_knowledge(
+        self,
+        faction: Faction,
+        indices: np.ndarray,
+        target_x: float,
+        target_y: float,
+    ) -> tuple[bool, bool]:
+        """Return whether the straight route contains known river and unknown cells."""
         start_x = float(np.mean(self.units.x[indices]) / self.subpixels)
         start_y = float(np.mean(self.units.y[indices]) / self.subpixels)
-        samples = RIVER_CROSSING_SAMPLES
-        ratios = np.linspace(0, 1, samples)
+        ratios = np.linspace(0, 1, RIVER_ROUTE_SAMPLES)
         xs = start_x + (target_x - start_x) * ratios
         ys = start_y + (target_y - start_y) * ratios
-        river_fraction = float(np.mean(self.map.terrain_at(xs, ys) == int(Terrain.RIVER)))
-        if river_fraction == 0:
-            return 0.0
-        distance = math.hypot(target_x - start_x, target_y - start_y)
-        river_distance = distance * river_fraction
-        river_speed = max(
-            1.0,
-            float(np.mean(self.units.speed[indices])) * self.balance.terrain_speed["river"],
+        cols = np.clip((xs // self.map.tile_size).astype(np.int32), 0, self.map.cols - 1)
+        rows = np.clip((ys // self.map.tile_size).astype(np.int32), 0, self.map.rows - 1)
+        terrain = self._known_terrain(faction)[rows, cols]
+        return bool(np.any(terrain == int(Terrain.RIVER))), bool(np.any(terrain == 255))
+
+    def _positions_on_bridges(self, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
+        protected = np.zeros(len(xs), dtype=np.bool_)
+        for facility in self.facilities:
+            if not facility.complete or facility.destroyed or facility.kind != FacilityKind.BRIDGE:
+                continue
+            protected |= self._inside_bridge_deck(facility, xs, ys)
+        return protected
+
+    def _bridge_at_position(self, x: float, y: float) -> Facility | None:
+        xs = np.asarray([x], dtype=np.float64)
+        ys = np.asarray([y], dtype=np.float64)
+        return next(
+            (
+                facility
+                for facility in self.facilities
+                if facility.complete
+                and not facility.destroyed
+                and facility.kind == FacilityKind.BRIDGE
+                and bool(self._inside_bridge_deck(facility, xs, ys)[0])
+            ),
+            None,
         )
-        return min(MAX_CROSSING_LOSS, river_distance / river_speed * self.balance.river_damage_per_second)
+
+    def _project_to_bridge_deck(
+        self, facility: Facility, x: float, y: float, unit_radius: float
+    ) -> tuple[float, float]:
+        half_length = (facility.bridge_length or self.map.tile_size * 8) / 2
+        half_width = max(1.0, BRIDGE_DECK_HALF_WIDTH - unit_radius)
+        if facility.bridge_vertical:
+            return (
+                float(np.clip(x, facility.x - half_width, facility.x + half_width)),
+                float(np.clip(y, facility.y - half_length, facility.y + half_length)),
+            )
+        return (
+            float(np.clip(x, facility.x - half_length, facility.x + half_length)),
+            float(np.clip(y, facility.y - half_width, facility.y + half_width)),
+        )
+
+    def _inside_bridge_deck(
+        self,
+        facility: Facility,
+        xs: np.ndarray,
+        ys: np.ndarray,
+        margin: np.ndarray | float = 0.0,
+    ) -> np.ndarray:
+        length = facility.bridge_length or self.map.tile_size * 8
+        half_width = np.maximum(1.0, BRIDGE_DECK_HALF_WIDTH - margin)
+        if facility.bridge_vertical:
+            along = np.abs(ys - facility.y)
+            across = np.abs(xs - facility.x)
+        else:
+            along = np.abs(xs - facility.x)
+            across = np.abs(ys - facility.y)
+        return (along <= length / 2) & (across <= half_width)
+
+    def bridge_span_at(self, x: float, y: float) -> tuple[float, bool]:
+        """Return bank-to-bank bridge length and whether the crossing is vertical."""
+        _, _, length, vertical = self.bridge_geometry_at(x, y)
+        return length, vertical
+
+    def bridge_geometry_at(self, x: float, y: float) -> tuple[float, float, float, bool]:
+        """Resolve bridge geometry from the authoritative map for physical simulation."""
+        geometry = self._bridge_geometry_from_terrain(self.map.terrain, x, y)
+        if geometry is None:
+            raise ValueError("此处没有可连接的两岸。")
+        return geometry
+
+    def known_bridge_geometry_at(
+        self, faction: Faction, x: float, y: float
+    ) -> tuple[float, float, float, bool] | None:
+        """Resolve a bridge only when that faction has explored both banks."""
+        return self._bridge_geometry_from_terrain(self._known_terrain(faction), x, y)
+
+    def _bridge_geometry_from_terrain(
+        self, terrain: np.ndarray, x: float, y: float
+    ) -> tuple[float, float, float, bool] | None:
+        """Find the shortest fully-known bank-to-bank axis through a river cell."""
+        col = int(np.clip(x // self.map.tile_size, 0, self.map.cols - 1))
+        row = int(np.clip(y // self.map.tile_size, 0, self.map.rows - 1))
+        if int(terrain[row, col]) != int(Terrain.RIVER):
+            return None
+        candidates: list[tuple[float, float, float, bool]] = []
+        for vertical in (False, True):
+            first = row if vertical else col
+            last = first
+            limit = self.map.rows if vertical else self.map.cols
+
+            def terrain_value(offset: int, axis_vertical: bool = vertical) -> int:
+                return int(terrain[offset, col] if axis_vertical else terrain[row, offset])
+
+            while first > 0 and terrain_value(first - 1) == int(Terrain.RIVER):
+                first -= 1
+            while last + 1 < limit and terrain_value(last + 1) == int(Terrain.RIVER):
+                last += 1
+            near_bank, far_bank = first - 1, last + 1
+            if near_bank < 0 or far_bank >= limit:
+                continue
+            bank_values = (terrain_value(near_bank), terrain_value(far_bank))
+            if any(value in {int(Terrain.RIVER), 255} for value in bank_values):
+                continue
+            length = float((far_bank - near_bank) * self.map.tile_size)
+            if vertical:
+                center_x = (col + 0.5) * self.map.tile_size
+                center_y = (near_bank + far_bank + 1) / 2 * self.map.tile_size
+            else:
+                center_x = (near_bank + far_bank + 1) / 2 * self.map.tile_size
+                center_y = (row + 0.5) * self.map.tile_size
+            candidates.append((float(center_x), float(center_y), length, vertical))
+        return min(candidates, key=lambda item: item[2]) if candidates else None
+
+    def _sync_bridge_navigation(self) -> None:
+        if self._perception is not None:
+            self._perception.invalidate_dynamic()
+        for faction in (Faction.PLAYER, Faction.ENEMY):
+            bridges = [
+                (
+                    facility.x,
+                    facility.y,
+                    facility.bridge_length or self.map.tile_size * 8,
+                    facility.bridge_vertical,
+                )
+                for facility in self.facilities
+                if facility.complete
+                and not facility.destroyed
+                and facility.kind == FacilityKind.BRIDGE
+                and (
+                    facility.faction == int(faction)
+                    or (
+                        self._perception is not None
+                        and self._perception.explored[
+                            int(faction),
+                            int(np.clip(facility.y // self.map.tile_size, 0, self.map.rows - 1)),
+                            int(np.clip(facility.x // self.map.tile_size, 0, self.map.cols - 1)),
+                        ]
+                    )
+                )
+            ]
+            self._flow_fields[faction].set_bridges(bridges, BRIDGE_RADIUS)
 
     @staticmethod
     def _formation_offsets(count: int, spacing: float) -> np.ndarray:
@@ -624,8 +848,12 @@ class World:
             self.units.kind[index] = int(new_kind)
             self._apply_stats(int(index), stats, hp_ratio)
             self.units.exposed[index] = new_kind != UnitKind.ASSASSIN
+        labels = {"infantry": "步兵", "scout": "侦察兵", "engineer": "工兵", "assassin": "刺客"}
         return self._result(
-            command, CommandStatus.ACCEPTED, "ok", f"已分化 {len(indices)} 名{payload.unit_kind}。"
+            command,
+            CommandStatus.ACCEPTED,
+            "ok",
+            f"已将 {len(indices)} 名预备兵训练为{labels[payload.unit_kind]}。",
         )
 
     def _apply_stats(self, index: int, stats: UnitStats, hp_ratio: float = 1.0) -> None:
@@ -665,6 +893,18 @@ class World:
             self.balance.tactics["cooldown"] * self.balance.world.simulation_hz
         )
         self.units.last_intense_tick[eligible] = self.tick
+        self.events.append(
+            GameEventV1(
+                tick=self.tick,
+                kind="tactic_started",
+                visible_to=1 << int(command.faction),
+                actor_id=int(self.units.entity_id[eligible[0]]),
+                payload={
+                    "kind": payload.kind,
+                    "unit_ids": [int(self.units.entity_id[index]) for index in eligible[:24]],
+                },
+            )
+        )
         if payload.target is not None:
             offsets = self._formation_offsets(len(eligible), FORMATION_SPACING)
             self.units.target_x[eligible] = np.rint(
@@ -708,7 +948,10 @@ class World:
         cmd_idx = self.commander_index(command.faction)
         is_protect = False
         if cmd_idx is not None:
-            cx, cy = float(self.units.x[cmd_idx]) / self.subpixels, float(self.units.y[cmd_idx]) / self.subpixels
+            cx, cy = (
+                float(self.units.x[cmd_idx]) / self.subpixels,
+                float(self.units.y[cmd_idx]) / self.subpixels,
+            )
             dist_sq = (payload.target.x - cx) ** 2 + (payload.target.y - cy) ** 2
             if dist_sq < 50**2:
                 is_protect = True
@@ -727,7 +970,9 @@ class World:
                 self.units.order[idx] = int(Order.GUARD)
                 self.units.focus_target[idx] = -1
             return self._result(
-                command, CommandStatus.ACCEPTED, "ok",
+                command,
+                CommandStatus.ACCEPTED,
+                "ok",
                 f"{len(indices)} 名单位正在将领周围集结保护。",
             )
         offsets = self._formation_offsets(len(indices), 20.0)
@@ -818,7 +1063,15 @@ class World:
                 f"至少需要 {minimum} 名工兵。",
             )
         x, y = float(payload.target.x), float(payload.target.y)
-        terrain = Terrain(int(self.map.terrain_at(x, y)))
+        known_terrain = self._known_terrain_at(command.faction, x, y)
+        if known_terrain == 255:
+            return self._result(
+                command,
+                CommandStatus.REJECTED,
+                "target_unexplored",
+                "目标区域尚未探索，无法确认工程落点。",
+            )
+        terrain = Terrain(known_terrain)
         if payload.facility_kind in {"bridge", "boat"} and terrain != Terrain.RIVER:
             return self._result(
                 command, CommandStatus.REJECTED, "requires_river", "桥梁或船只必须在河流区域建造。"
@@ -831,6 +1084,47 @@ class World:
             return self._result(
                 command, CommandStatus.REJECTED, "invalid_terrain", "该地形不能建造防御塔。"
             )
+        bridge_length = 0.0
+        bridge_vertical = False
+        required_work = float(spec["work"])
+        if payload.facility_kind == "bridge":
+            geometry = self.known_bridge_geometry_at(command.faction, x, y)
+            if geometry is None:
+                return self._result(
+                    command,
+                    CommandStatus.REJECTED,
+                    "bridge_banks_unexplored",
+                    "需要先探索并确认河流两岸，才能规划桥梁。",
+                )
+            x, y, bridge_length, bridge_vertical = geometry
+            half_length = bridge_length / 2
+            endpoint_x = 0.0 if bridge_vertical else half_length
+            endpoint_y = half_length if bridge_vertical else 0.0
+            ends = self.map.terrain_at(
+                np.asarray([x - endpoint_x, x + endpoint_x]),
+                np.asarray([y - endpoint_y, y + endpoint_y]),
+            )
+            if np.any(ends == int(Terrain.RIVER)):
+                return self._result(
+                    command,
+                    CommandStatus.REJECTED,
+                    "bridge_needs_two_banks",
+                    "此处无法连接两岸，请选择完整河段架桥。",
+                )
+            baseline = self.map.tile_size * 7
+            required_work *= float(np.clip(bridge_length / baseline, 0.75, 3.0))
+        minimum_spacing = self.map.tile_size * (1.5 if payload.facility_kind == "bridge" else 1.0)
+        if any(
+            not facility.destroyed
+            and (facility.x - x) ** 2 + (facility.y - y) ** 2 < minimum_spacing**2
+            for facility in self.facilities
+        ):
+            return self._result(
+                command,
+                CommandStatus.REJECTED,
+                "facility_overlap",
+                "此处已有设施或正在施工，请换一个位置。",
+            )
         facility = Facility(
             facility_id=self.next_facility_id,
             faction=int(command.faction),
@@ -838,12 +1132,14 @@ class World:
             x=x,
             y=y,
             progress=0.0,
-            required_work=float(spec["work"]),
+            required_work=required_work,
             minimum_engineers=minimum,
             hp=float(spec["hp"]),
             max_hp=float(spec["hp"]),
             complete=False,
             builder_ids=[int(self.units.entity_id[index]) for index in indices],
+            bridge_length=bridge_length,
+            bridge_vertical=bridge_vertical,
         )
         self.next_facility_id += 1
         self.facilities.append(facility)
@@ -851,11 +1147,17 @@ class World:
         self.units.facility_id[indices] = facility.facility_id
         self.units.target_x[indices] = round(x * self.subpixels)
         self.units.target_y[indices] = round(y * self.subpixels)
+        labels = {"bridge": "桥梁", "boat": "船只", "road": "道路", "tower": "防御塔"}
+        detail = (
+            f"跨度 {bridge_length:.0f}、工程量 {required_work:.0f} 的"
+            if payload.facility_kind == "bridge"
+            else ""
+        )
         return self._result(
             command,
             CommandStatus.ACCEPTED,
             "ok",
-            f"{len(indices)} 名工兵开始建造{payload.facility_kind}。",
+            f"{len(indices)} 名工兵开始建造{detail}{labels[payload.facility_kind]}。",
         )
 
     def _execute_recruit(
@@ -968,21 +1270,37 @@ class World:
                 "capacity_or_distance",
                 "设施已满，或所选单位距离设施过远。",
             )
-        self.units.facility_id[entering] = facility.facility_id
-        self.units.x[entering] = round(facility.x * self.subpixels)
-        self.units.y[entering] = round(facility.y * self.subpixels)
-        self.units.target_x[entering] = self.units.x[entering]
-        self.units.target_y[entering] = self.units.y[entering]
-        self.units.order[entering] = int(Order.IDLE)
         if payload.kind == "enter_tower":
-            self.units.attack_range[entering] = float(
-                self.balance.facilities["tower"]["attack_range"]
-            )
-            self.units.vision[entering] = float(self.balance.facilities["tower"]["vision"])
+            self._garrison_tower(facility, entering, convert_engineers=False)
+        else:
+            self.units.facility_id[entering] = facility.facility_id
+            self.units.x[entering] = round(facility.x * self.subpixels)
+            self.units.y[entering] = round(facility.y * self.subpixels)
+            self.units.target_x[entering] = self.units.x[entering]
+            self.units.target_y[entering] = self.units.y[entering]
+            self.units.order[entering] = int(Order.IDLE)
         label = "进入防御塔" if payload.kind == "enter_tower" else "完成登船"
         return self._result(
             command, CommandStatus.ACCEPTED, "ok", f"{len(entering)} 名单位已{label}。"
         )
+
+    def _garrison_tower(
+        self, facility: Facility, indices: np.ndarray, *, convert_engineers: bool
+    ) -> None:
+        """Place units in a tower and apply its archer role."""
+        for index in indices:
+            if convert_engineers and self.units.kind[index] == int(UnitKind.ENGINEER):
+                hp_ratio = float(self.units.hp[index] / max(self.units.max_hp[index], 1))
+                self.units.kind[index] = int(UnitKind.INFANTRY)
+                self._apply_stats(int(index), self.balance.units["infantry"], hp_ratio)
+        self.units.facility_id[indices] = facility.facility_id
+        self.units.x[indices] = round(facility.x * self.subpixels)
+        self.units.y[indices] = round(facility.y * self.subpixels)
+        self.units.target_x[indices] = self.units.x[indices]
+        self.units.target_y[indices] = self.units.y[indices]
+        self.units.order[indices] = int(Order.IDLE)
+        self.units.attack_range[indices] = float(self.balance.facilities["tower"]["attack_range"])
+        self.units.vision[indices] = float(self.balance.facilities["tower"]["vision"])
 
     def _find_facility(
         self,
@@ -1019,17 +1337,20 @@ class World:
             collision_due = self.tick % 5 == 1
             if collision_due:
                 self._resolve_collisions()
+            self._constrain_units_to_bridge_decks()
+            self._restore_illegal_river_entries()
             if self.tick % 4 == 0:
                 self._update_assassin_exposure()
             if self.tick % 4 == 0 and not collision_due:
                 self._resolve_combat()
             self._update_engineering()
+            self._auto_garrison_towers()
             self._update_boats()
-            self._apply_river_damage()
             self._check_victory()
             if self._perception is not None:
                 if self.tick % 10 == 0:
                     self._perception.update(self)
+                    self._sync_bridge_navigation()
                 else:
                     self._perception.invalidate_dynamic()
             self.tick += 1
@@ -1109,20 +1430,36 @@ class World:
         dx, dy, distance = dx[moving], dy[moving], distance[moving]
         target_cols = self.units.target_x[indices] // self.subpixels // self.map.tile_size // 8
         target_rows = self.units.target_y[indices] // self.subpixels // self.map.tile_size // 8
-        for target_col, target_row in np.unique(
-            np.column_stack((target_cols, target_rows)), axis=0
+        factions = self.units.faction[indices]
+        for target_col, target_row, faction_value in np.unique(
+            np.column_stack((target_cols, target_rows, factions)), axis=0
         ):
             group_mask = (
                 (target_cols == target_col)
                 & (target_rows == target_row)
-                & (distance > self.map.tile_size * 2)
+                & (factions == faction_value)
+                & (distance > self.map.tile_size * 4)
             )
             if not np.any(group_mask):
                 continue
             group = indices[group_mask]
-            field = self._flow_fields.get(
-                float(self.units.target_x[group[0]] / self.subpixels),
-                float(self.units.target_y[group[0]] / self.subpixels),
+            target_x = float(self.units.target_x[group[0]] / self.subpixels)
+            target_y = float(self.units.target_y[group[0]] / self.subpixels)
+            crosses_known_river, has_unknown = self._route_knowledge(
+                Faction(int(faction_value)), group, target_x, target_y
+            )
+            faction = Faction(int(faction_value))
+            # Unknown terrain is treated as traversable until scouts actually reveal
+            # an obstacle. This prevents pathfinding from leaking the hidden map.
+            if has_unknown and not crosses_known_river:
+                continue
+            # An order issued into fog may later discover a river. Do not silently
+            # reroute it over a globally known but faction-hidden bridge.
+            if crosses_known_river and not self._has_known_complete_bridge(faction):
+                continue
+            field = self._flow_fields[faction].get(
+                target_x,
+                target_y,
             )
             cols = np.clip(
                 self.units.x[group] // self.subpixels // self.map.tile_size,
@@ -1138,8 +1475,14 @@ class World:
             steer_y = field.direction_y[rows, cols].astype(np.float64)
             usable = (steer_x != 0) | (steer_y != 0)
             positions = np.flatnonzero(group_mask)
-            dx[positions[usable]] = steer_x[usable]
-            dy[positions[usable]] = steer_y[usable]
+            next_cols = cols[usable] + steer_x[usable].astype(np.int32)
+            next_rows = rows[usable] + steer_y[usable].astype(np.int32)
+            group_x = self.units.x[group[usable]] / self.subpixels
+            group_y = self.units.y[group[usable]] / self.subpixels
+            # Steer toward the next cell centre instead of following a raw
+            # eight-direction vector. This prevents oscillation at river banks.
+            dx[positions[usable]] = (next_cols + 0.5) * self.map.tile_size - group_x
+            dy[positions[usable]] = (next_rows + 0.5) * self.map.tile_size - group_y
         direction_length = np.sqrt(dx * dx + dy * dy)
         terrain = self.map.terrain_at(
             self.units.x[indices] / self.subpixels, self.units.y[indices] / self.subpixels
@@ -1156,12 +1499,11 @@ class World:
             dtype=np.float32,
         )
         terrain_multiplier = speed_table[terrain]
-        for facility in self.facilities:
-            if facility.complete and facility.kind == FacilityKind.BRIDGE:
-                bx = self.units.x[indices] / self.subpixels - facility.x
-                by = self.units.y[indices] / self.subpixels - facility.y
-                on_bridge = bx * bx + by * by < BRIDGE_RADIUS**2
-                terrain_multiplier[on_bridge] = 0.95
+        on_bridge = self._positions_on_bridges(
+            self.units.x[indices] / self.subpixels,
+            self.units.y[indices] / self.subpixels,
+        )
+        terrain_multiplier[on_bridge] = 0.95
         tactic = self.units.tactic_kind[indices]
         strength = self._tactic_strength(indices)
         multiplier = np.ones(len(indices), dtype=np.float32)
@@ -1173,17 +1515,147 @@ class World:
         multiplier[charge] += (self.balance.tactics["charge_speed_multiplier"] - 1) * strength[
             charge
         ]
-        step = np.minimum(
-            distance, self.units.speed[indices] * terrain_multiplier * multiplier * self.dt
+        usable_direction = direction_length > 1e-6
+        step = np.zeros(len(indices), dtype=np.float64)
+        step[usable_direction] = np.minimum(
+            distance[usable_direction],
+            self.units.speed[indices[usable_direction]]
+            * terrain_multiplier[usable_direction]
+            * multiplier[usable_direction]
+            * self.dt,
         )
-        self.units.x[indices] += np.rint(dx / direction_length * step * self.subpixels).astype(
-            np.int32
+        next_x = self.units.x[indices].astype(np.int64)
+        next_y = self.units.y[indices].astype(np.int64)
+        next_x[usable_direction] += np.rint(
+            dx[usable_direction]
+            / direction_length[usable_direction]
+            * step[usable_direction]
+            * self.subpixels
+        ).astype(np.int64)
+        next_y[usable_direction] += np.rint(
+            dy[usable_direction]
+            / direction_length[usable_direction]
+            * step[usable_direction]
+            * self.subpixels
+        ).astype(np.int64)
+        world_x = next_x / self.subpixels
+        world_y = next_y / self.subpixels
+        next_terrain = self.map.terrain_at(world_x, world_y)
+        passable = (next_terrain != int(Terrain.RIVER)) | self._positions_on_bridges(
+            world_x, world_y
         )
-        self.units.y[indices] += np.rint(dy / direction_length * step * self.subpixels).astype(
-            np.int32
-        )
+        self.units.x[indices[passable]] = next_x[passable].astype(np.int32)
+        self.units.y[indices[passable]] = next_y[passable].astype(np.int32)
         self.units.x[indices] = np.clip(self.units.x[indices], 0, self.map.width * self.subpixels)
         self.units.y[indices] = np.clip(self.units.y[indices], 0, self.map.height * self.subpixels)
+
+    def _constrain_units_to_bridge_decks(self) -> None:
+        """Clamp unit centres to the visible deck after movement and collision pushes."""
+        active = self.units.active()
+        active = active[self.units.facility_id[active] < 0]
+        if not len(active):
+            return
+        xs = self.units.x[active] / self.subpixels
+        ys = self.units.y[active] / self.subpixels
+        previous_xs = self.units.previous_x[active] / self.subpixels
+        previous_ys = self.units.previous_y[active] / self.subpixels
+        river = self.map.terrain_at(xs, ys) == int(Terrain.RIVER)
+        radii = self.units.radius[active]
+        for facility in self.facilities:
+            if not facility.complete or facility.destroyed or facility.kind != FacilityKind.BRIDGE:
+                continue
+            length = facility.bridge_length or self.map.tile_size * 8
+            current_inside = self._inside_bridge_deck(facility, xs, ys)
+            previous_inside = self._inside_bridge_deck(facility, previous_xs, previous_ys)
+            if facility.bridge_vertical:
+                along = np.abs(ys - facility.y) <= length / 2
+                candidates = river & along & (current_inside | previous_inside)
+                usable = np.maximum(1.0, BRIDGE_DECK_HALF_WIDTH - radii[candidates])
+                self.units.x[active[candidates]] = np.rint(
+                    np.clip(
+                        xs[candidates],
+                        facility.x - usable,
+                        facility.x + usable,
+                    )
+                    * self.subpixels
+                ).astype(np.int32)
+            else:
+                along = np.abs(xs - facility.x) <= length / 2
+                candidates = river & along & (current_inside | previous_inside)
+                usable = np.maximum(1.0, BRIDGE_DECK_HALF_WIDTH - radii[candidates])
+                self.units.y[active[candidates]] = np.rint(
+                    np.clip(
+                        ys[candidates],
+                        facility.y - usable,
+                        facility.y + usable,
+                    )
+                    * self.subpixels
+                ).astype(np.int32)
+
+    def _restore_illegal_river_entries(self) -> None:
+        """Keep land units out of water, including bridge-edge collision pushes."""
+        active = self.units.active()
+        if not len(active):
+            return
+        xs = self.units.x[active] / self.subpixels
+        ys = self.units.y[active] / self.subpixels
+        boat_ids = {
+            facility.facility_id
+            for facility in self.facilities
+            if facility.kind == "boat" and facility.complete and not facility.destroyed
+        }
+        in_boat = np.isin(
+            self.units.facility_id[active],
+            np.fromiter(boat_ids, dtype=np.int32),
+        )
+        illegal = (
+            (self.map.terrain_at(xs, ys) == int(Terrain.RIVER))
+            & ~self._positions_on_bridges(xs, ys)
+            & ~in_boat
+        )
+        restore = active[illegal]
+        if not len(restore):
+            return
+        previous_xs = self.units.previous_x[restore] / self.subpixels
+        previous_ys = self.units.previous_y[restore] / self.subpixels
+        previous_is_legal = (
+            self.map.terrain_at(previous_xs, previous_ys) != int(Terrain.RIVER)
+        ) | self._positions_on_bridges(previous_xs, previous_ys)
+        safe_previous = restore[previous_is_legal]
+        self.units.x[safe_previous] = self.units.previous_x[safe_previous]
+        self.units.y[safe_previous] = self.units.previous_y[safe_previous]
+        for index in restore[~previous_is_legal]:
+            safe_x, safe_y = self._nearest_land_position(
+                float(self.units.x[index] / self.subpixels),
+                float(self.units.y[index] / self.subpixels),
+            )
+            self.units.x[index] = round(safe_x * self.subpixels)
+            self.units.y[index] = round(safe_y * self.subpixels)
+
+    def _nearest_land_position(self, x: float, y: float) -> tuple[float, float]:
+        """Find a deterministic nearby land tile for an already-invalid land unit."""
+        tile_size = self.map.tile_size
+        origin_col = int(np.clip(x // tile_size, 0, self.map.cols - 1))
+        origin_row = int(np.clip(y // tile_size, 0, self.map.rows - 1))
+        for distance in range(1, max(self.map.rows, self.map.cols)):
+            candidates: list[tuple[int, int]] = []
+            for offset in range(-distance, distance + 1):
+                candidates.extend(
+                    (
+                        (origin_row - distance, origin_col + offset),
+                        (origin_row + distance, origin_col + offset),
+                        (origin_row + offset, origin_col - distance),
+                        (origin_row + offset, origin_col + distance),
+                    )
+                )
+            for row, col in candidates:
+                if (
+                    0 <= row < self.map.rows
+                    and 0 <= col < self.map.cols
+                    and self.map.terrain[row, col] != int(Terrain.RIVER)
+                ):
+                    return (col + 0.5) * tile_size, (row + 0.5) * tile_size
+        return x, y
 
     def _advance_orders(self, arrived: np.ndarray) -> None:
         for index in arrived:
@@ -1203,6 +1675,7 @@ class World:
 
     def _resolve_collisions(self) -> None:
         active = self.units.active()
+        active = active[self.units.facility_id[active] < 0]
         cell_size = COLLISION_CELL_SIZE
         buckets: dict[tuple[int, int], list[int]] = {}
         for index in active:
@@ -1226,16 +1699,36 @@ class World:
                         second = candidates[start + (sample_start - start + offset) % available]
                         dx = float(self.units.x[second] - self.units.x[first]) / self.subpixels
                         dy = float(self.units.y[second] - self.units.y[first]) / self.subpixels
-                        minimum = float(self.units.radius[first] + self.units.radius[second]) * COLLISION_OVERLAP_FACTOR
+                        minimum = (
+                            float(self.units.radius[first] + self.units.radius[second])
+                            * COLLISION_OVERLAP_FACTOR
+                        )
                         distance_sq = dx * dx + dy * dy
                         if 0 < distance_sq < minimum * minimum:
                             distance = math.sqrt(distance_sq)
-                            push = min((minimum - distance) * COLLISION_PUSH_FACTOR, COLLISION_MAX_PUSH) * self.subpixels
+                            push = (
+                                min(
+                                    (minimum - distance) * COLLISION_PUSH_FACTOR, COLLISION_MAX_PUSH
+                                )
+                                * self.subpixels
+                            )
                             px, py = dx / distance * push, dy / distance * push
-                            self.units.x[first] -= round(px)
-                            self.units.y[first] -= round(py)
-                            self.units.x[second] += round(px)
-                            self.units.y[second] += round(py)
+                            same_faction = self.units.faction[first] == self.units.faction[second]
+                            first_is_commander = self.units.kind[first] == int(UnitKind.COMMANDER)
+                            second_is_commander = self.units.kind[second] == int(UnitKind.COMMANDER)
+                            if same_faction and first_is_commander and not second_is_commander:
+                                self.units.x[second] += round(px * 2)
+                                self.units.y[second] += round(py * 2)
+                            elif same_faction and second_is_commander and not first_is_commander:
+                                self.units.x[first] -= round(px * 2)
+                                self.units.y[first] -= round(py * 2)
+                            else:
+                                self.units.x[first] -= round(px)
+                                self.units.y[first] -= round(py)
+                                self.units.x[second] += round(px)
+                                self.units.y[second] += round(py)
+        self.units.x[active] = np.clip(self.units.x[active], 0, self.map.width * self.subpixels)
+        self.units.y[active] = np.clip(self.units.y[active], 0, self.map.height * self.subpixels)
 
     def _update_assassin_exposure(self) -> None:
         hidden = np.flatnonzero(
@@ -1286,13 +1779,10 @@ class World:
         )
         crossing = terrain == int(Terrain.RIVER)
         if np.any(crossing):
-            protected = np.zeros(len(attackers), dtype=np.bool_)
-            for facility in self.facilities:
-                if not facility.complete or facility.kind != FacilityKind.BRIDGE:
-                    continue
-                dx = self.units.x[attackers] / self.subpixels - facility.x
-                dy = self.units.y[attackers] / self.subpixels - facility.y
-                protected |= dx * dx + dy * dy < BRIDGE_RADIUS**2
+            protected = self._positions_on_bridges(
+                self.units.x[attackers] / self.subpixels,
+                self.units.y[attackers] / self.subpixels,
+            )
             attackers = attackers[~crossing | protected]
         return attackers
 
@@ -1350,9 +1840,7 @@ class World:
                     attacker, focus_facility_id, visible_facilities, facility_attacks
                 )
                 continue
-            best_target = self._find_nearest_target(
-                attacker, buckets, cell, visible_targets
-            )
+            best_target = self._find_nearest_target(attacker, buckets, cell, visible_targets)
             if best_target is None:
                 continue
             best_target = self._guard_intercept(best_target)
@@ -1376,8 +1864,7 @@ class World:
         )
         if (
             focused_facility is None
-            or focus_facility_id
-            not in visible_facilities[int(self.units.faction[attacker])]
+            or focus_facility_id not in visible_facilities[int(self.units.faction[attacker])]
         ):
             self.units.focus_facility[attacker] = -1
         else:
@@ -1432,14 +1919,8 @@ class World:
                 )
                 for offset in range(sample_count):
                     target = candidates[(start + offset) % len(candidates)]
-                    dx = (
-                        float(self.units.x[target] - self.units.x[attacker])
-                        / self.subpixels
-                    )
-                    dy = (
-                        float(self.units.y[target] - self.units.y[attacker])
-                        / self.subpixels
-                    )
+                    dx = float(self.units.x[target] - self.units.x[attacker]) / self.subpixels
+                    dy = float(self.units.y[target] - self.units.y[attacker]) / self.subpixels
                     distance_sq = dx * dx + dy * dy
                     if distance_sq < best_distance:
                         best_target, best_distance = target, distance_sq
@@ -1484,9 +1965,7 @@ class World:
             self.units.target_x[attacker] = self.units.x[target]
             self.units.target_y[attacker] = self.units.y[target]
 
-    def _apply_facility_damage(
-        self, facility_attacks: list[tuple[int, int, float]]
-    ) -> None:
+    def _apply_facility_damage(self, facility_attacks: list[tuple[int, int, float]]) -> None:
         if not facility_attacks:
             return
         facility_damage: dict[int, float] = {}
@@ -1518,6 +1997,12 @@ class World:
                 payload={
                     "attacks": len(attacks),
                     "total_damage": round(sum(item[2] for item in attacks), 2),
+                    "attacker_x": round(float(self.units.x[first_attacker]) / self.subpixels, 2),
+                    "attacker_y": round(float(self.units.y[first_attacker]) / self.subpixels, 2),
+                    "target_x": round(float(self.units.x[first_target]) / self.subpixels, 2),
+                    "target_y": round(float(self.units.y[first_target]) / self.subpixels, 2),
+                    "ranged": bool(self.units.attack_range[first_attacker] > MELEE_RANGE_THRESHOLD),
+                    "tactic": int(self.units.tactic_kind[first_attacker]),
                 },
             )
         )
@@ -1558,7 +2043,14 @@ class World:
                     continue
                 dx = self.units.x[index] / self.subpixels - facility.x
                 dy = self.units.y[index] / self.subpixels - facility.y
-                if dx * dx + dy * dy <= BUILD_PROXIMITY**2:
+                build_range = (
+                    (facility.bridge_length or self.map.tile_size * 8) / 2 + self.map.tile_size
+                    if facility.kind == FacilityKind.BRIDGE
+                    else BRIDGE_RADIUS
+                    if facility.kind == FacilityKind.BOAT
+                    else BUILD_PROXIMITY
+                )
+                if dx * dx + dy * dy <= build_range**2:
                     builders.append(index)
             if len(builders) < facility.minimum_engineers:
                 continue
@@ -1580,6 +2072,8 @@ class World:
                 self.units.order[builder_array] = int(Order.IDLE)
                 if facility.kind == FacilityKind.ROAD:
                     self.map.clear_forest(facility.x, facility.y)
+                elif facility.kind == FacilityKind.BRIDGE:
+                    self._sync_bridge_navigation()
                 self.events.append(
                     GameEventV1(
                         tick=self.tick,
@@ -1589,15 +2083,59 @@ class World:
                     )
                 )
 
+    def _auto_garrison_towers(self) -> None:
+        """Engineers reaching a friendly tower automatically take up its archer posts."""
+        for facility in self.facilities:
+            if facility.kind != FacilityKind.TOWER or not facility.complete or facility.destroyed:
+                continue
+            capacity = int(self.balance.facilities["tower"].get("capacity", 20))
+            occupied = int(
+                np.sum(self.units.facility_id[: self.units.count] == facility.facility_id)
+            )
+            available = capacity - occupied
+            if available <= 0:
+                continue
+            engineers = np.flatnonzero(
+                self.units.alive[: self.units.count]
+                & (self.units.faction[: self.units.count] == facility.faction)
+                & (self.units.kind[: self.units.count] == int(UnitKind.ENGINEER))
+                & (self.units.facility_id[: self.units.count] < 0)
+            )
+            if not len(engineers):
+                continue
+            dx = self.units.x[engineers] / self.subpixels - facility.x
+            dy = self.units.y[engineers] / self.subpixels - facility.y
+            arrivals = engineers[dx * dx + dy * dy <= BUILD_PROXIMITY**2][:available]
+            if not len(arrivals):
+                continue
+            self._garrison_tower(facility, arrivals, convert_engineers=True)
+            self.events.append(
+                GameEventV1(
+                    tick=self.tick,
+                    kind="tower_garrisoned",
+                    visible_to=1 << facility.faction,
+                    payload={
+                        "facility_id": facility.facility_id,
+                        "count": len(arrivals),
+                    },
+                )
+            )
+
     def _destroy_facility(self, facility: Facility) -> None:
         facility.hp = 0
         facility.complete = False
         facility.destroyed = True
+        if facility.kind == FacilityKind.BRIDGE:
+            self._sync_bridge_navigation()
         occupants = np.flatnonzero(
             self.units.facility_id[: self.units.count] == facility.facility_id
         )
         damage = (
-            float(self.balance.facilities["boat"].get("destroyed_damage", DEFAULT_DESTROYED_BOAT_DAMAGE))
+            float(
+                self.balance.facilities["boat"].get(
+                    "destroyed_damage", DEFAULT_DESTROYED_BOAT_DAMAGE
+                )
+            )
             if facility.kind == FacilityKind.BOAT
             else 0.0
         )
@@ -1606,10 +2144,12 @@ class World:
                 self.units.hp[index] -= damage
             angle = number * GOLDEN_ANGLE
             self.units.x[index] = round(
-                np.clip(facility.x + math.cos(angle) * FACILITY_EJECT_RADIUS, 0, self.map.width) * self.subpixels
+                np.clip(facility.x + math.cos(angle) * FACILITY_EJECT_RADIUS, 0, self.map.width)
+                * self.subpixels
             )
             self.units.y[index] = round(
-                np.clip(facility.y + math.sin(angle) * FACILITY_EJECT_RADIUS, 0, self.map.height) * self.subpixels
+                np.clip(facility.y + math.sin(angle) * FACILITY_EJECT_RADIUS, 0, self.map.height)
+                * self.subpixels
             )
             self.units.facility_id[index] = -1
             self.units.order[index] = int(Order.IDLE)
@@ -1651,34 +2191,6 @@ class World:
             self.units.x[occupants] = round(facility.x * self.subpixels)
             self.units.y[occupants] = round(facility.y * self.subpixels)
 
-    def _apply_river_damage(self) -> None:
-        active = self.units.active()
-        terrain = self.map.terrain_at(
-            self.units.x[active] / self.subpixels, self.units.y[active] / self.subpixels
-        )
-        in_river = active[terrain == int(Terrain.RIVER)]
-        if not len(in_river):
-            return
-        protected = np.zeros(len(in_river), dtype=np.bool_)
-        for facility in self.facilities:
-            if not facility.complete or facility.kind not in {
-                FacilityKind.BRIDGE,
-                FacilityKind.BOAT,
-            }:
-                continue
-            if facility.kind == FacilityKind.BOAT:
-                protected |= self.units.facility_id[in_river] == facility.facility_id
-                continue
-            dx = self.units.x[in_river] / self.subpixels - facility.x
-            dy = self.units.y[in_river] / self.subpixels - facility.y
-            protected |= dx * dx + dy * dy < BRIDGE_RADIUS**2
-        affected = in_river[~protected]
-        self.units.hp[affected] -= self.balance.river_damage_per_second * self.dt
-        self.units.last_intense_tick[affected] = self.tick
-        dead = affected[self.units.hp[affected] <= 0]
-        for index in dead:
-            self._kill_unit(int(index))
-
     def _kill_unit(self, index: int, killer_faction: int | None = None) -> None:
         if not self.units.alive[index]:
             return
@@ -1695,6 +2207,13 @@ class World:
                 tick=self.tick,
                 kind="unit_died",
                 target_id=int(self.units.entity_id[index]),
+                payload={
+                    "x": round(float(self.units.x[index]) / self.subpixels, 2),
+                    "y": round(float(self.units.y[index]) / self.subpixels, 2),
+                    "faction": faction,
+                    "kind": kind_name,
+                    "commander": kind_name == "commander",
+                },
             )
         )
 
@@ -1758,6 +2277,7 @@ class World:
         world.victory_enabled = bool(payload.get("victory_enabled", True))
         world.units = UnitStore.from_dict(payload["units"])
         world.facilities = [Facility(**item) for item in payload["facilities"]]
+        world._sync_bridge_navigation()
         world.groups = {
             int(side): {int(key): value for key, value in groups.items()}
             for side, groups in payload["groups"].items()
@@ -1786,6 +2306,7 @@ class World:
             world._perception = FogOfWar.from_dict(
                 payload["perception"], world.map.rows, world.map.cols, world.map.tile_size
             )
+            world._sync_bridge_navigation()
         return world
 
     def checksum(self) -> str:

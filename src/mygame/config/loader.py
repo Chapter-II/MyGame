@@ -39,7 +39,6 @@ class BalanceConfig(BaseModel):
     units: dict[str, UnitStats]
     terrain_speed: dict[str, float]
     terrain_vision: dict[str, float]
-    river_damage_per_second: float
     facilities: dict[str, dict[str, float | int]]
     ai: dict[str, dict[str, float | int | bool]]
 
@@ -66,7 +65,6 @@ def load_balance() -> BalanceConfig:
         units=units,
         terrain_speed={key: float(value) for key, value in raw["terrain"]["speed"].items()},
         terrain_vision={key: float(value) for key, value in raw["terrain"]["vision"].items()},
-        river_damage_per_second=float(raw["terrain"]["river_damage_per_second"]),
         facilities=facilities,
         ai={name: dict(values) for name, values in raw["ai"].items()},
     )

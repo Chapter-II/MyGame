@@ -106,6 +106,7 @@ def test_suggester_returns_suggestions_for_partial_input() -> None:
 def test_compound_command_splitting_recognized() -> None:
     """Verify that compound conjunctions produce multiple parseable segments."""
     import re
+
     text = "第一战团前往中央然后工兵架桥"
     segments = re.split(r"\s*(?:然后|接着|并且|同时|再|并)\s*", text)
     assert len(segments) == 2

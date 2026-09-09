@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import math
 import random
+from typing import Literal
+
+import numpy as np
 
 from mygame.protocols import (
     BuildPayloadV1,
@@ -9,7 +12,6 @@ from mygame.protocols import (
     CommandSource,
     ConvertPayloadV1,
     Faction,
-    FacilityActionPayloadV1,
     FocusFirePayloadV1,
     GuardPayloadV1,
     MovePayloadV1,
@@ -18,7 +20,6 @@ from mygame.protocols import (
     RecruitPayloadV1,
     SelectionV1,
     TacticalPayloadV1,
-    UnitObservationV1,
 )
 
 _DIFFICULTY_PROFILES: dict[str, dict[str, float | int | bool]] = {
@@ -141,7 +142,8 @@ class LocalStrategicAI:
             return PositionV1(x=float(sighting["x"]), y=float(sighting["y"]))
         if self._last_known_enemy_pos:
             return PositionV1(x=self._last_known_enemy_pos[0], y=self._last_known_enemy_pos[1])
-        return PositionV1(x=self.width * 0.08, y=self.height * 0.5)
+        target_x = self.width * (0.92 if obs.faction == Faction.PLAYER else 0.08)
+        return PositionV1(x=target_x, y=self.height * 0.5)
 
     def _order_assault(
         self, obs: ObservationSnapshotV1, target: PositionV1
@@ -179,7 +181,14 @@ class LocalStrategicAI:
         # Offset scouts significantly to the side for recon
         offset = self.height * 0.3 * (1 if obs.tick % 800 < 400 else -1)
         return PositionV1(
-            x=max(0.0, min(self.width, primary_target.x - self.width * 0.15)),
+            x=max(
+                0.0,
+                min(
+                    self.width,
+                    primary_target.x
+                    + (-1 if obs.faction == Faction.PLAYER else 1) * self.width * 0.15,
+                ),
+            ),
             y=max(0.0, min(self.height, primary_target.y + offset)),
         )
 
@@ -191,23 +200,41 @@ class LocalStrategicAI:
         commands: list[CommandEnvelopeV1] = []
         engineer_target = self._pick_engineer_target(obs)
 
-        bridge_exists = any(f["kind"] == "bridge" for f in obs.known_facilities)
-        boat_exists = any(f["kind"] == "boat" for f in obs.known_facilities)
-        tower_exists = any(f["kind"] == "tower" for f in obs.known_facilities)
+        own_facilities = [
+            facility
+            for facility in obs.known_facilities
+            if int(facility["faction"]) == int(obs.faction) and not bool(facility["destroyed"])
+        ]
+        # Do not overwrite the engineers' BUILD order while a project is in progress.
+        if any(not bool(facility["complete"]) for facility in own_facilities):
+            return commands
+        bridge_exists = any(f["kind"] == "bridge" for f in own_facilities)
+        boat_exists = any(f["kind"] == "boat" for f in own_facilities)
+        tower_exists = any(f["kind"] == "tower" for f in own_facilities)
 
         # Priority 1: Build bridge if none exists
         if not bridge_exists:
-            bridge_y = self.height * 0.5 + self._rng.uniform(-self.height * 0.1, self.height * 0.1)
+            river_target = self._known_river_target(obs)
+            if river_target is None:
+                staging_x = self.width * (0.43 if obs.faction == Faction.PLAYER else 0.57)
+                return [
+                    self._move_cmd(
+                        obs,
+                        3,
+                        PositionV1(x=staging_x, y=self.height * 0.5),
+                        kind="move",
+                    )
+                ]
             commands.append(
                 CommandEnvelopeV1(
-                    command_id=f"ai-{obs.tick}-bridge",
-                    faction=Faction.ENEMY,
+                    command_id=f"ai-{int(obs.faction)}-{obs.tick}-bridge",
+                    faction=obs.faction,
                     issued_tick=obs.tick,
                     source=CommandSource.LOCAL_AI,
                     payload=BuildPayloadV1(
                         selection=SelectionV1(group_id=3),
                         facility_kind="bridge",
-                        target=PositionV1(x=self.width * 0.5, y=bridge_y),
+                        target=river_target,
                     ),
                 )
             )
@@ -218,8 +245,8 @@ class LocalStrategicAI:
             boat_y = self.height * 0.5 + self._rng.uniform(-self.height * 0.15, self.height * 0.15)
             commands.append(
                 CommandEnvelopeV1(
-                    command_id=f"ai-{obs.tick}-boat",
-                    faction=Faction.ENEMY,
+                    command_id=f"ai-{int(obs.faction)}-{obs.tick}-boat",
+                    faction=obs.faction,
                     issued_tick=obs.tick,
                     source=CommandSource.LOCAL_AI,
                     payload=BuildPayloadV1(
@@ -239,8 +266,8 @@ class LocalStrategicAI:
             )
             commands.append(
                 CommandEnvelopeV1(
-                    command_id=f"ai-{obs.tick}-tower",
-                    faction=Faction.ENEMY,
+                    command_id=f"ai-{int(obs.faction)}-{obs.tick}-tower",
+                    faction=obs.faction,
                     issued_tick=obs.tick,
                     source=CommandSource.LOCAL_AI,
                     payload=BuildPayloadV1(
@@ -262,8 +289,8 @@ class LocalStrategicAI:
             road_y = self.height * 0.5
             commands.append(
                 CommandEnvelopeV1(
-                    command_id=f"ai-{obs.tick}-road",
-                    faction=Faction.ENEMY,
+                    command_id=f"ai-{int(obs.faction)}-{obs.tick}-road",
+                    faction=obs.faction,
                     issued_tick=obs.tick,
                     source=CommandSource.LOCAL_AI,
                     payload=BuildPayloadV1(
@@ -276,10 +303,27 @@ class LocalStrategicAI:
             return commands
 
         # Default: engineers move to nearest village or assist assault
-        commands.append(
-            self._move_cmd(obs, 3, engineer_target, kind="move")
-        )
+        commands.append(self._move_cmd(obs, 3, engineer_target, kind="move"))
         return commands
+
+    def _known_river_target(self, obs: ObservationSnapshotV1) -> PositionV1 | None:
+        if not obs.known_terrain or not obs.terrain_shape[0] or not obs.terrain_shape[1]:
+            return None
+        terrain = np.frombuffer(obs.known_terrain, dtype=np.uint8).reshape(obs.terrain_shape)
+        rows, cols = np.nonzero(terrain == 4)
+        if not len(rows):
+            return None
+        middle_row = obs.terrain_shape[0] / 2
+        choice = min(
+            range(len(rows)),
+            key=lambda index: abs(float(rows[index]) - middle_row),
+        )
+        tile_width = self.width / obs.terrain_shape[1]
+        tile_height = self.height / obs.terrain_shape[0]
+        return PositionV1(
+            x=(float(cols[choice]) + 0.5) * tile_width,
+            y=(float(rows[choice]) + 0.5) * tile_height,
+        )
 
     def _pick_engineer_target(self, obs: ObservationSnapshotV1) -> PositionV1:
         if obs.known_villages:
@@ -288,7 +332,8 @@ class LocalStrategicAI:
                 key=lambda v: abs(float(v["x"]) - self.width / 2),
             )
             return PositionV1(x=float(village["x"]), y=float(village["y"]))
-        return PositionV1(x=self.width * 0.62, y=self.height * 0.62)
+        fallback_x = self.width * (0.62 if obs.faction == Faction.PLAYER else 0.38)
+        return PositionV1(x=fallback_x, y=self.height * 0.62)
 
     def _order_recruit(self, obs: ObservationSnapshotV1) -> list[CommandEnvelopeV1]:
         commands: list[CommandEnvelopeV1] = []
@@ -301,8 +346,8 @@ class LocalStrategicAI:
             ):
                 commands.append(
                     CommandEnvelopeV1(
-                        command_id=f"ai-{obs.tick}-recruit",
-                        faction=Faction.ENEMY,
+                        command_id=f"ai-{int(obs.faction)}-{obs.tick}-recruit",
+                        faction=obs.faction,
                         issued_tick=obs.tick,
                         source=CommandSource.LOCAL_AI,
                         payload=RecruitPayloadV1(
@@ -317,7 +362,7 @@ class LocalStrategicAI:
     def _order_conversions(self, obs: ObservationSnapshotV1) -> list[CommandEnvelopeV1]:
         """Convert recruits to useful classes based on army composition."""
         commands: list[CommandEnvelopeV1] = []
-        recruits = [u for u in obs.own_units if u.kind == "recruit" and u.group_id == 0]
+        recruits = [u for u in obs.own_units if u.kind == "recruit"]
         if not recruits:
             return commands
 
@@ -335,8 +380,8 @@ class LocalStrategicAI:
         if current_scouts < target_scouts and len(recruits) >= 1:
             commands.append(
                 CommandEnvelopeV1(
-                    command_id=f"ai-{obs.tick}-convert-scout",
-                    faction=Faction.ENEMY,
+                    command_id=f"ai-{int(obs.faction)}-{obs.tick}-convert-scout",
+                    faction=obs.faction,
                     issued_tick=obs.tick,
                     source=CommandSource.LOCAL_AI,
                     payload=ConvertPayloadV1(
@@ -351,8 +396,8 @@ class LocalStrategicAI:
         if current_engineers < 10 and len(recruits) >= 5:
             commands.append(
                 CommandEnvelopeV1(
-                    command_id=f"ai-{obs.tick}-convert-eng",
-                    faction=Faction.ENEMY,
+                    command_id=f"ai-{int(obs.faction)}-{obs.tick}-convert-eng",
+                    faction=obs.faction,
                     issued_tick=obs.tick,
                     source=CommandSource.LOCAL_AI,
                     payload=ConvertPayloadV1(
@@ -367,8 +412,8 @@ class LocalStrategicAI:
         if current_assassins < 5 and len(recruits) >= 3 and obs.tick > 3000:
             commands.append(
                 CommandEnvelopeV1(
-                    command_id=f"ai-{obs.tick}-convert-assassin",
-                    faction=Faction.ENEMY,
+                    command_id=f"ai-{int(obs.faction)}-{obs.tick}-convert-assassin",
+                    faction=obs.faction,
                     issued_tick=obs.tick,
                     source=CommandSource.LOCAL_AI,
                     payload=ConvertPayloadV1(
@@ -383,8 +428,8 @@ class LocalStrategicAI:
         if len(recruits) >= 10:
             commands.append(
                 CommandEnvelopeV1(
-                    command_id=f"ai-{obs.tick}-convert-infantry",
-                    faction=Faction.ENEMY,
+                    command_id=f"ai-{int(obs.faction)}-{obs.tick}-convert-infantry",
+                    faction=obs.faction,
                     issued_tick=obs.tick,
                     source=CommandSource.LOCAL_AI,
                     payload=ConvertPayloadV1(
@@ -431,14 +476,15 @@ class LocalStrategicAI:
         """Pull back units with HP below threshold."""
         commands: list[CommandEnvelopeV1] = []
         damaged = [
-            u for u in obs.own_units
+            u
+            for u in obs.own_units
             if u.hp < retreat_ratio and u.kind not in ("commander", "guard")
         ]
         if not damaged:
             return commands
 
         # Retreat toward own spawn zone (right side of map)
-        retreat_x = self.width * 0.85
+        retreat_x = self.width * (0.15 if obs.faction == Faction.PLAYER else 0.85)
         retreat_y = self.height * 0.5
 
         # Only retreat a few at a time to avoid command spam
@@ -464,8 +510,8 @@ class LocalStrategicAI:
         retreat_ids = tuple(u.entity_id for u in retreat_sample)
         commands.append(
             CommandEnvelopeV1(
-                command_id=f"ai-{obs.tick}-retreat",
-                faction=Faction.ENEMY,
+                command_id=f"ai-{int(obs.faction)}-{obs.tick}-retreat",
+                faction=obs.faction,
                 issued_tick=obs.tick,
                 source=CommandSource.LOCAL_AI,
                 payload=MovePayloadV1(
@@ -491,8 +537,8 @@ class LocalStrategicAI:
         assassin_ids = tuple(u.entity_id for u in assassins[:5])
         return [
             CommandEnvelopeV1(
-                command_id=f"ai-{obs.tick}-focus-cmd",
-                faction=Faction.ENEMY,
+                command_id=f"ai-{int(obs.faction)}-{obs.tick}-focus-cmd",
+                faction=obs.faction,
                 issued_tick=obs.tick,
                 source=CommandSource.LOCAL_AI,
                 payload=FocusFirePayloadV1(
@@ -520,16 +566,14 @@ class LocalStrategicAI:
             avg_y = sum(u.y for u in group_units) / len(group_units)
 
             # Check if near any enemy
-            min_dist = min(
-                math.hypot(avg_x - e.x, avg_y - e.y) for e in obs.visible_enemies
-            )
+            min_dist = min(math.hypot(avg_x - e.x, avg_y - e.y) for e in obs.visible_enemies)
 
             if min_dist < 300 and self._rng.random() < aggression:
                 # Charge when close
                 commands.append(
                     CommandEnvelopeV1(
-                        command_id=f"ai-{obs.tick}-charge-{group_id}",
-                        faction=Faction.ENEMY,
+                        command_id=f"ai-{int(obs.faction)}-{obs.tick}-charge-{group_id}",
+                        faction=obs.faction,
                         issued_tick=obs.tick,
                         source=CommandSource.LOCAL_AI,
                         payload=TacticalPayloadV1(
@@ -540,11 +584,13 @@ class LocalStrategicAI:
                 )
             elif min_dist < 600 and self._rng.random() < aggression * 0.5:
                 # Sprint to close distance
-                nearest = min(obs.visible_enemies, key=lambda e: math.hypot(avg_x - e.x, avg_y - e.y))
+                nearest = min(
+                    obs.visible_enemies, key=lambda e: math.hypot(avg_x - e.x, avg_y - e.y)
+                )
                 commands.append(
                     CommandEnvelopeV1(
-                        command_id=f"ai-{obs.tick}-sprint-{group_id}",
-                        faction=Faction.ENEMY,
+                        command_id=f"ai-{int(obs.faction)}-{obs.tick}-sprint-{group_id}",
+                        faction=obs.faction,
                         issued_tick=obs.tick,
                         source=CommandSource.LOCAL_AI,
                         payload=TacticalPayloadV1(
@@ -571,16 +617,15 @@ class LocalStrategicAI:
 
         # If enemies are near commander, have guards intercept
         nearby_enemies = [
-            e for e in obs.visible_enemies
-            if math.hypot(cmd_unit.x - e.x, cmd_unit.y - e.y) < 400
+            e for e in obs.visible_enemies if math.hypot(cmd_unit.x - e.x, cmd_unit.y - e.y) < 400
         ]
         if nearby_enemies:
             threat = nearby_enemies[0]
             guard_ids = tuple(u.entity_id for u in guards[:4])
             commands.append(
                 CommandEnvelopeV1(
-                    command_id=f"ai-{obs.tick}-guard-protect",
-                    faction=Faction.ENEMY,
+                    command_id=f"ai-{int(obs.faction)}-{obs.tick}-guard-protect",
+                    faction=obs.faction,
                     issued_tick=obs.tick,
                     source=CommandSource.LOCAL_AI,
                     payload=GuardPayloadV1(
@@ -599,11 +644,11 @@ class LocalStrategicAI:
         obs: ObservationSnapshotV1,
         group: int,
         target: PositionV1,
-        kind: str = "attack_move",
+        kind: Literal["move", "attack_move"] = "attack_move",
     ) -> CommandEnvelopeV1:
         return CommandEnvelopeV1(
-            command_id=f"ai-{obs.tick}-{group}",
-            faction=Faction.ENEMY,
+            command_id=f"ai-{int(obs.faction)}-{obs.tick}-{group}",
+            faction=obs.faction,
             issued_tick=obs.tick,
             source=CommandSource.LOCAL_AI,
             payload=MovePayloadV1(

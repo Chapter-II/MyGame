@@ -24,6 +24,28 @@ def test_map_seed_is_reproducible() -> None:
     assert [v.population for v in first.villages] == [v.population for v in second.villages]
 
 
+def test_generated_river_has_no_walkable_gaps() -> None:
+    battle_map = generate_map(seed=29)
+    widths = np.sum(battle_map.terrain == 4, axis=1)
+    assert np.all(widths >= 4)
+    assert set(widths) == {4, 6, 8, 10, 12}
+    assert np.max(np.abs(np.diff(widths))) <= 2
+    for row in range(battle_map.rows):
+        river_cols = np.flatnonzero(battle_map.terrain[row] == 4)
+        assert np.all(np.diff(river_cols) == 1)
+
+
+def test_generated_map_has_all_terrain_roles_and_six_objectives() -> None:
+    battle_map = generate_map(seed=29)
+    terrain_counts = np.bincount(battle_map.terrain.ravel(), minlength=6)
+
+    assert np.all(terrain_counts > 0)
+    assert terrain_counts[5] >= 300  # A real road network, not isolated decoration.
+    assert len(battle_map.villages) == 6
+    assert sum(village.x < battle_map.width / 2 for village in battle_map.villages) == 3
+    assert sum(village.x > battle_map.width / 2 for village in battle_map.villages) == 3
+
+
 @settings(max_examples=12, deadline=None)
 @given(seed=st.integers(min_value=0, max_value=2**31 - 1), symmetric=st.booleans())
 def test_generated_maps_pass_fairness_and_serialization(seed: int, symmetric: bool) -> None:
@@ -47,7 +69,12 @@ def test_flow_field_is_shared_and_invalidated_by_terrain_revision() -> None:
     cache = FlowFieldCache(battle_map, speed)
     first = cache.get(3500, 1152)
     assert cache.get(3501, 1153) is first
-    assert np.isfinite(first.integration).all()
-    assert first.direction_x[36, 10] != 0 or first.direction_y[36, 10] != 0
+    assert not np.isfinite(first.integration).all()
+    assert first.direction_x[36, 10] == 0 and first.direction_y[36, 10] == 0
+    cache.set_bridges([(battle_map.width / 2, battle_map.height / 2)], 160)
+    bridged = cache.get(3500, 1152)
+    assert bridged is not first
+    assert np.isfinite(bridged.integration[36, 10])
+    assert bridged.direction_x[36, 10] != 0 or bridged.direction_y[36, 10] != 0
     battle_map.revision += 1
-    assert cache.get(3500, 1152) is not first
+    assert cache.get(3500, 1152) is not bridged
