@@ -24,6 +24,7 @@ class ArtBook:
         self.facility_cache: dict[tuple[str, int, int, bool], pygame.Surface] = {}
         self.village_cache: dict[int, pygame.Surface] = {}
         self.effect_cache: dict[tuple[str, int], pygame.Surface] = {}
+        self._commander_sources: dict[int, pygame.Surface] = {}
         self._load()
 
     @staticmethod
@@ -76,6 +77,21 @@ class ArtBook:
         except (FileNotFoundError, pygame.error, ValueError):
             logger.info("单位贴图图集不可用，使用战术标记回退", exc_info=True)
 
+        for faction_idx, label in ((0, "ally"), (1, "enemy")):
+            path = root / f"commander_{label}.png"
+            try:
+                source = pygame.image.load(path).convert_alpha()
+                bounds = source.get_bounding_rect(min_alpha=8)
+                cropped = source.subsurface(bounds).copy() if bounds.width else source
+                side = max(cropped.get_width(), cropped.get_height())
+                normalized = pygame.Surface((side, side), pygame.SRCALPHA)
+                normalized.blit(cropped, cropped.get_rect(center=normalized.get_rect().center))
+                self._commander_sources[faction_idx] = normalized
+            except (FileNotFoundError, pygame.error, ValueError):
+                pass
+        if 1 not in self._commander_sources and 0 in self._commander_sources:
+            self._commander_sources[1] = self._commander_sources[0]
+
         for facility_kind in ("bridge", "tower"):
             try:
                 self.facility_sources[facility_kind] = pygame.image.load(
@@ -122,14 +138,16 @@ class ArtBook:
         return self.terrain_cache[key]
 
     def unit(self, faction: int, kind: int, size: int) -> pygame.Surface | None:
-        source = self.unit_sources.get((faction, kind))
+        # 优先使用独立将领贴图
+        if kind == 5 and faction in self._commander_sources:
+            source = self._commander_sources[faction]
+        else:
+            source = self.unit_sources.get((faction, kind))
         if source is None:
             return None
         size = max(4, size)
         key = (faction, kind, size)
         if key not in self.unit_cache:
-            # A high-quality downsample becomes the pixel source; the final display
-            # layer still scales it with nearest-neighbour filtering.
             self.unit_cache[key] = pygame.transform.smoothscale(source, (size, size))
         return self.unit_cache[key]
 

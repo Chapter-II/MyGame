@@ -2526,6 +2526,9 @@ class GameApp:
                 self.canvas.blit(sprite, sprite_rect)
             if kind == UnitKind.COMMANDER:
                 pygame.draw.circle(self.canvas, self.theme.warning, (sx, sy), radius + 5, 2)
+                commander_name = "奶娃" if faction == int(Faction.PLAYER) else "豆包"
+                name_y = sy - (sprite_size // 2 + 12 if sprite is not None else radius + 12)
+                self._blit_text(commander_name, sx, name_y, 13, faction_color, True, center=True)
             if entity_id in self.selected_ids:
                 selection_radius = max(radius + 4, sprite_size // 2 if sprite is not None else 0)
                 pygame.draw.circle(self.canvas, self.theme.ink, (sx, sy), selection_radius, 1)
@@ -2723,6 +2726,7 @@ class GameApp:
                 ("暂停" if not self.paused else "继续", self._toggle_pause, 54),
                 ("帮助", lambda: setattr(self, "help_open", True), 50),
                 ("全屏", self._toggle_fullscreen, 50),
+                ("返回", lambda: setattr(self, "scene", "menu"), 46),
             ]
         else:
             actions = [
@@ -2735,7 +2739,7 @@ class GameApp:
                 ("帮助", lambda: setattr(self, "help_open", True), 46),
                 ("全屏", self._toggle_fullscreen, 46),
             ]
-        button_x = 530 if self.scene != "replay" else 566
+        button_x = 530 if self.scene != "replay" else 530
         for label, action, width in actions:
             self._draw_compact_button(
                 pygame.Rect(button_x, 5, width, 30),
@@ -3059,6 +3063,7 @@ class GameApp:
                 ("暂停" if not self.paused else "继续", self._toggle_pause, 54),
                 ("帮助", lambda: setattr(self, "help_open", True), 50),
                 ("全屏", self._toggle_fullscreen, 50),
+                ("返回", lambda: setattr(self, "scene", "menu"), 46),
             ]
         else:
             actions = [
@@ -3420,7 +3425,7 @@ class GameApp:
 
     def _draw_help(self) -> None:
         overlay = pygame.Surface(LOGICAL_SIZE, pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 190))
+        overlay.fill((0, 0, 0, 235))
         self.canvas.blit(overlay, (0, 0))
         panel = pygame.Rect(80, 50, 1120, 620)
         pygame.draw.rect(self.canvas, self.theme.surface, panel, border_radius=10)
