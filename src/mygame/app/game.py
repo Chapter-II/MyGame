@@ -20,7 +20,13 @@ import pygame
 from mygame.ai import LocalStrategicAI
 from mygame.commands import DeepSeekCommandParser, RuleCommandParser
 from mygame.constants import BRIDGE_DECK_HALF_WIDTH, ENEMY_CLICK_RADIUS_SQ, UNIT_CLICK_RADIUS_SQ
-from mygame.input import MicrophoneRecorder, VoiceUnavailable, WhisperRecognizer
+from mygame.input import (
+    MicrophoneRecorder,
+    SpeechPipeline,
+    VoiceUnavailable,
+    WhisperRecognizer,
+    is_audible,
+)
 from mygame.maps import Terrain, generate_map
 from mygame.persistence import (
     ReplayPlayer,
@@ -261,10 +267,16 @@ class GameApp:
         self.microphone = MicrophoneRecorder()
         self.whisper = WhisperRecognizer(
             os.getenv("MYGAME_WHISPER_MODEL", "small"),
-            allow_download=os.getenv("MYGAME_ALLOW_MODEL_DOWNLOAD") == "1",
+            allow_download=(
+                os.getenv("MYGAME_ALLOW_MODEL_DOWNLOAD") == "1"
+                or getattr(self.settings, "voice_allow_download", False)
+            ),
+            language=os.getenv("MYGAME_WHISPER_LANG", "zh"),
         )
+        self.speech = SpeechPipeline(self.whisper)
         self.pending_voice_samples: bytes | None = None
         self.recording = False
+        self.voice_toggle_pending = False
         self.selected_ids: set[int] = set()
         self.drag_start: tuple[int, int] | None = None
         self.minimap_dragging = False
@@ -494,7 +506,9 @@ class GameApp:
                 )
                 self.screen = pygame.display.set_mode(self._windowed_size, pygame.RESIZABLE)
             elif event.type == pygame.WINDOWFOCUSLOST and self.recording:
+                self.microphone.abort()
                 self.recording = False
+                self.voice_toggle_pending = False
                 self._message("窗口失焦，语音录制已取消。", self.theme.warning)
             elif self.scene in {"menu", "setup", "settings", "tutorial"}:
                 self._menu_event(event)
@@ -668,12 +682,7 @@ class GameApp:
             elif event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
                 self.speed = max(0.5, self.speed / 2)
             elif event.key == pygame.K_v and not self.recording and self.scene == "battle":
-                try:
-                    self.microphone.start()
-                    self.recording = True
-                    self._message("正在聆听……松开 V 结束。", self.theme.warning)
-                except VoiceUnavailable as exc:
-                    self._message(str(exc), self.theme.enemy)
+                self._start_voice_capture()
             elif pygame.K_1 <= event.key <= pygame.K_9:
                 group = event.key - pygame.K_0
                 if event.mod & pygame.KMOD_CTRL:
@@ -711,10 +720,7 @@ class GameApp:
                 finally:
                     self.running = False
         elif event.type == pygame.KEYUP and event.key == pygame.K_v and self.recording:
-            samples = self.microphone.stop()
-            self.recording = False
-            self.pending_voice_samples = samples
-            self.pending_voice = self.executor.submit(self.whisper.transcribe, samples)
+            self._finish_voice_capture()
         elif event.type == pygame.MOUSEBUTTONDOWN:
             point = self._logical_mouse(event.pos)
             if event.button == 1 and MINIMAP_RECT.collidepoint(point):
@@ -774,6 +780,98 @@ class GameApp:
         x = (point[0] - viewport.x) * LOGICAL_SIZE[0] / max(viewport.width, 1)
         y = (point[1] - viewport.y) * LOGICAL_SIZE[1] / max(viewport.height, 1)
         return round(x), round(y)
+
+    def _start_voice_capture(self) -> None:
+        if self.scene != "battle" or self.recording:
+            return
+        if self.pending_voice is not None and not self.pending_voice.done():
+            self._message("正在转写上一条语音，请稍候。", self.theme.warning)
+            return
+        if self.typing:
+            self.typing = False
+            if hasattr(pygame.key, "stop_text_input"):
+                pygame.key.stop_text_input()
+        try:
+            self.microphone.start()
+        except VoiceUnavailable as exc:
+            self.recording = False
+            self._message(str(exc), self.theme.enemy)
+            return
+        self.recording = True
+        self._message("正在聆听……松开 V 或再次点击结束。", self.theme.warning)
+
+    def _finish_voice_capture(self) -> None:
+        if not self.recording:
+            return
+        samples = self.microphone.stop()
+        self.recording = False
+        self.voice_toggle_pending = False
+        if not samples:
+            self._message("没有采集到声音。", self.theme.muted)
+            return
+        if not is_audible(samples, self.microphone.sample_rate):
+            self._message("录音过短或过轻，已忽略。请对着麦克风再说一次。", self.theme.warning)
+            return
+        self.pending_voice_samples = samples
+        engine = "在线" if self.speech.online_ready else "本地"
+        self._message(f"正在用{engine}引擎识别语音……", self.theme.ink)
+        self.pending_voice = self.executor.submit(self._transcribe_voice_samples, samples)
+
+    def _transcribe_voice_samples(self, samples: bytes) -> str:
+        """Worker: online ASR first when online mode is on, else local Whisper."""
+        if self.online_enabled and self.speech.online.available:
+            try:
+                text = self.speech.online.transcribe(
+                    samples, self.microphone.sample_rate, require_audible=False
+                )
+                if text:
+                    return text
+            except VoiceUnavailable as exc:
+                logger.warning("online speech failed, falling back to local: %s", exc)
+        return self.whisper.transcribe(
+            samples, self.microphone.sample_rate, require_audible=False
+        )
+
+    def _toggle_voice_capture(self) -> None:
+        """Mouse path for hold/talk: click once to start, click again to stop."""
+        if self.recording:
+            self._finish_voice_capture()
+        else:
+            self._start_voice_capture()
+
+    def _voice_button_label(self) -> str:
+        if self.recording:
+            return "结束"
+        if self.pending_voice is not None and not self.pending_voice.done():
+            return "转写中"
+        return "语音"
+
+    def _voice_settings_label(self) -> str:
+        status = self.whisper.status()
+        local = status.get("local_path")
+        online = "在线ASR就绪 · " if self.speech.online.available else ""
+        if local:
+            return f"{online}本地模型就绪 · {self.whisper.model_name}"
+        if self.whisper.allow_download:
+            return f"{online}允许下载 {self.whisper.model_name} · 按 V 时加载"
+        if online:
+            return "仅在线语音 · 设置 SPEECH_API_KEY 已就绪"
+        return "未就绪 · 可配 SPEECH_API_KEY 或允许下载本地模型"
+
+    def _toggle_voice_download(self) -> None:
+        self.whisper.allow_download = not self.whisper.allow_download
+        if self.whisper.allow_download:
+            self._message(
+                "已允许下载语音模型；首次识别会联网获取，请耐心等待。",
+                self.theme.warning,
+            )
+        else:
+            self._message("已关闭语音模型下载；离线文字命令仍可用。", self.theme.muted)
+        try:
+            self.settings.voice_allow_download = self.whisper.allow_download
+            SettingsManager().save(self.settings)
+        except Exception:
+            logger.debug("failed to persist voice download preference", exc_info=True)
 
     def _submit_text(self) -> None:
         if self.world is None or self.scene != "battle":
@@ -853,7 +951,7 @@ class GameApp:
             return
         viewport = self._viewport()
         scale = viewport.width / LOGICAL_SIZE[0]
-        box = pygame.Rect(342, 636, 484, 38)
+        box = pygame.Rect(342, 636, 360, 38)
         screen_rect = pygame.Rect(
             viewport.x + int(box.x * scale),
             viewport.y + int(box.y * scale),
@@ -1381,12 +1479,20 @@ class GameApp:
                     self._message(f"识别：{transcript}", self.theme.ink)
                     self._submit_text()
                 else:
-                    self._message("没有识别到语音。", self.theme.enemy)
+                    self.pending_voice_samples = None
+                    self._message(
+                        "没有识别到有效军令。请再说一次，或改用文字输入。",
+                        self.theme.enemy,
+                    )
             except VoiceUnavailable as exc:
                 self.pending_voice = None
-                self._message(f"{exc} 按 Y 允许下载，按 N 取消。", self.theme.warning)
+                if self.pending_voice_samples:
+                    self._message(f"{exc} 按 Y 允许下载，按 N 取消。", self.theme.warning)
+                else:
+                    self._message(str(exc), self.theme.enemy)
             except Exception as exc:
                 self.pending_voice = None
+                self.pending_voice_samples = None
                 self._message(f"语音识别失败：{type(exc).__name__}", self.theme.enemy)
 
     def _consume_events(self) -> None:
@@ -1762,10 +1868,15 @@ class GameApp:
                 ),
                 self._toggle_online,
             ),
+            (
+                "语音军令",
+                self._voice_settings_label(),
+                self._toggle_voice_download,
+            ),
         ]
         mouse = self._mouse_pos
         for index, (label, value, action) in enumerate(rows):
-            y = 226 + index * 66
+            y = 226 + index * 60
             self._blit_text(label, 138, y + 18, 15, self.theme.muted, center_y=True)
             rect = pygame.Rect(540, y, 540, 38)
             pygame.draw.rect(
@@ -1776,9 +1887,12 @@ class GameApp:
             )
             pygame.draw.rect(self.canvas, self.theme.border, rect, 1, border_radius=6)
             self._blit_text(
-                value, rect.x + 14, rect.centery, 15, self.theme.ink, True, center_y=True
+                value, rect.x + 14, rect.centery, 14, self.theme.ink, True, center_y=True,
+                max_width=rect.width - 28,
             )
-            enabled = index < 4 or (index == 4 and self.deepseek.available)
+            enabled = True
+            if index == 4:
+                enabled = self.deepseek.available
             self.buttons.append(Button(rect, label, action, enabled))
         self._draw_action_button(
             pygame.Rect(990, 610, 190, 42), "返回主菜单", lambda: setattr(self, "scene", "menu")
@@ -1826,7 +1940,7 @@ class GameApp:
                 "05 · 存档与离线保障",
                 [
                     "F5 快速保存，F9 载入；Space 暂停，- / + 调整速度。",
-                    "DeepSeek、语音和网络均为可选能力，离线输入始终保留。",
+                    "按住 V 或点击「按住说话」下达语音军令；离线文字输入始终保留。",
                     "服务失败时按 R 重试、O 离线继续、Q 创建临时存档并退出。",
                 ],
             ),
@@ -2938,8 +3052,10 @@ class GameApp:
             return
 
         self._blit_text("文字军令", 342, 614, 13, self.theme.ink, True)
-        box = pygame.Rect(342, 636, 484, 38)
-        send = pygame.Rect(836, 636, 98, 38)
+        # Bottom deck is 960 wide; keep all controls inside [342, 940].
+        box = pygame.Rect(342, 636, 360, 38)
+        voice = pygame.Rect(710, 636, 100, 38)
+        send = pygame.Rect(818, 636, 90, 38)
         pygame.draw.rect(self.canvas, self.theme.surface, box, border_radius=6)
         pygame.draw.rect(
             self.canvas,
@@ -2958,7 +3074,7 @@ class GameApp:
                 center_y=True,
                 max_width=box.width - 24,
             )
-            self._draw_compact_button(send, "执行军令", self._submit_text, True)
+            self._draw_compact_button(send, "执行", self._submit_text, True)
             if self.suggestions:
                 suggestion_height = len(self.suggestions) * 27 + 6
                 suggestion_box = pygame.Rect(
@@ -2998,9 +3114,23 @@ class GameApp:
                 max_width=box.width - 24,
             )
             self.buttons.append(Button(box, "输入文字军令", self._begin_text_input))
-            self._draw_compact_button(send, "输入军令", self._begin_text_input, True)
+            self._draw_compact_button(send, "军令", self._begin_text_input, True)
+        voice_busy = self.pending_voice is not None and not self.pending_voice.done()
+        self._draw_compact_button(
+            voice,
+            self._voice_button_label(),
+            self._toggle_voice_capture,
+            accent=self.recording,
+            enabled=self.recording or not voice_busy,
+        )
+        if self.recording:
+            level = max(0.0, min(1.0, self.microphone.level * 4.0))
+            meter = pygame.Rect(voice.x + 10, voice.bottom - 6, int((voice.width - 20) * level), 3)
+            pygame.draw.rect(self.canvas, self.theme.warning, meter, border_radius=2)
+            seconds = f"{self.microphone.seconds:.1f}s"
+            self._blit_text(seconds, voice.centerx, voice.y - 16, 11, self.theme.warning, True)
         self._blit_text(
-            "左键选择 · 右键行动/建造 · 滚轮缩放 · 中键拖动地图",
+            "左键选择 · 右键行动/建造 · 滚轮缩放 · V/按钮语音",
             342,
             686,
             11,

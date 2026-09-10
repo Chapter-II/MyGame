@@ -4,6 +4,33 @@ import argparse
 import json
 import os
 import time
+from pathlib import Path
+
+
+def _load_local_env() -> None:
+    """Load local.env (KEY=value) if present; never override existing env."""
+    candidates = [
+        Path.cwd() / "local.env",
+        Path(__file__).resolve().parents[2] / "local.env",
+        Path(__file__).resolve().parents[3] / "local.env",
+    ]
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, _, value = stripped.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+        return
 
 
 def _headless(ticks: int) -> int:
@@ -38,6 +65,7 @@ def _headless(ticks: int) -> int:
 
 
 def main() -> int:
+    _load_local_env()
     from mygame.logging_setup import configure_logging
 
     configure_logging()

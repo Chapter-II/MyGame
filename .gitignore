@@ -11,3 +11,5 @@ __pycache__/
 *.mgsave
 *.mgreplay
 *.log
+/local.env
+

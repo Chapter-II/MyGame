@@ -18,6 +18,7 @@ class SettingsV1(BaseModel):
     fullscreen: bool = False
     master_volume: float = 0.5
     group_names: dict[int, str] = Field(default_factory=dict)
+    voice_allow_download: bool = False
 
 
 class SettingsManager:
