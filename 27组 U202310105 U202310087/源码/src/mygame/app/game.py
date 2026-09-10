@@ -813,26 +813,19 @@ class GameApp:
             self._message("录音过短或过轻，已忽略。请对着麦克风再说一次。", self.theme.warning)
             return
         self.pending_voice_samples = samples
-        if self.online_enabled and self.speech.online.available:
-            engine = f"在线({self.speech.online.provider})"
-        else:
-            engine = "本地"
+        engine = "在线" if self.speech.online_ready else "本地"
         self._message(f"正在用{engine}引擎识别语音……", self.theme.ink)
         self.pending_voice = self.executor.submit(self._transcribe_voice_samples, samples)
 
     def _transcribe_voice_samples(self, samples: bytes) -> str:
-        """Worker: DeepSeek/online ASR first, then local Whisper."""
+        """Worker: online ASR first when online mode is on, else local Whisper."""
         if self.online_enabled and self.speech.online.available:
             try:
                 text = self.speech.online.transcribe(
                     samples, self.microphone.sample_rate, require_audible=False
                 )
                 if text:
-                    logger.info(
-                        "voice asr via %s", self.speech.online.status().get("provider")
-                    )
                     return text
-                logger.warning("online speech returned empty; trying local whisper")
             except VoiceUnavailable as exc:
                 logger.warning("online speech failed, falling back to local: %s", exc)
         return self.whisper.transcribe(
@@ -856,20 +849,14 @@ class GameApp:
     def _voice_settings_label(self) -> str:
         status = self.whisper.status()
         local = status.get("local_path")
-        online = self.speech.online
-        if online.available and self.online_enabled:
-            prefix = f"优先在线({online.provider}) · "
-        elif online.available:
-            prefix = "在线ASR已配置(当前关闭) · "
-        else:
-            prefix = ""
+        online = "在线ASR就绪 · " if self.speech.online.available else ""
         if local:
-            return f"{prefix}本地模型就绪 · {self.whisper.model_name}"
+            return f"{online}本地模型就绪 · {self.whisper.model_name}"
         if self.whisper.allow_download:
-            return f"{prefix}允许下载 {self.whisper.model_name}"
-        if online.available:
-            return f"优先在线({online.provider}) · 本地模型未下载"
-        return "未就绪 · 可配 DEEPSEEK_API_KEY / SPEECH_API_KEY 或下载本地模型"
+            return f"{online}允许下载 {self.whisper.model_name} · 按 V 时加载"
+        if online:
+            return "仅在线语音 · 设置 SPEECH_API_KEY 已就绪"
+        return "未就绪 · 可配 SPEECH_API_KEY 或允许下载本地模型"
 
     def _toggle_voice_download(self) -> None:
         self.whisper.allow_download = not self.whisper.allow_download

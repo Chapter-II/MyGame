@@ -176,28 +176,6 @@ def test_online_recognizer_requires_api_key() -> None:
         online.transcribe(b"\x01\x00" * 8000, require_audible=False)
 
 
-def test_online_recognizer_prefers_deepseek_key_when_speech_key_absent(monkeypatch) -> None:
-    monkeypatch.delenv("SPEECH_API_KEY", raising=False)
-    monkeypatch.delenv("SPEECH_API_URL", raising=False)
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-deepseek-test")
-    monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-    online = OnlineSpeechRecognizer()
-    assert online.available is True
-    assert online.provider == "deepseek"
-    assert online.api_key == "sk-deepseek-test"
-    assert online.base_url.endswith("/v1")
-
-
-def test_online_recognizer_speech_key_wins_over_deepseek(monkeypatch) -> None:
-    monkeypatch.setenv("SPEECH_API_KEY", "sk-speech-test")
-    monkeypatch.setenv("SPEECH_API_URL", "https://asr.example.com/v1")
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-deepseek-test")
-    online = OnlineSpeechRecognizer()
-    assert online.provider == "speech-api"
-    assert online.api_key == "sk-speech-test"
-    assert online.base_url == "https://asr.example.com/v1"
-
-
 def test_online_recognizer_posts_multipart(monkeypatch) -> None:
     from mygame.input import voice as voice_mod
 

@@ -1,0 +1,15 @@
+/.venv/
+/build/
+/dist/
+/.pytest_cache/
+/.ruff_cache/
+/.mypy_cache/
+/.hypothesis/
+*.egg-info/
+__pycache__/
+*.py[cod]
+*.mgsave
+*.mgreplay
+*.log
+/local.env
+

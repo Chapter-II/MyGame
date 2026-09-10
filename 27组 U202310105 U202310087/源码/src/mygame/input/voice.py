@@ -301,13 +301,12 @@ def encode_wav(samples: bytes, sample_rate: int = DEFAULT_SAMPLE_RATE) -> bytes:
 class OnlineSpeechRecognizer:
     """OpenAI-compatible speech-to-text (POST {base}/audio/transcriptions).
 
-    Credential priority:
-      1. SPEECH_API_KEY / SPEECH_API_URL  (dedicated ASR gateway)
-      2. DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL (reuse DeepSeek account; may 404
-         if the provider has no Whisper endpoint — callers fall back to local)
-
     Works with OpenAI, Groq, Azure OpenAI, SiliconFlow and similar gateways
-    that expose the multipart Whisper API.
+    that expose the multipart Whisper API. Configure via env:
+      SPEECH_API_KEY   required
+      SPEECH_API_URL   default https://api.openai.com/v1
+      SPEECH_API_MODEL default whisper-1
+      SPEECH_API_LANG  default zh
     """
 
     def __init__(
@@ -318,46 +317,14 @@ class OnlineSpeechRecognizer:
         language: str | None = None,
         timeout: float = 20.0,
     ) -> None:
-        speech_key = os.getenv("SPEECH_API_KEY", "")
-        deepseek_key = os.getenv("DEEPSEEK_API_KEY", "")
-        if api_key is not None:
-            resolved_key = api_key
-        elif speech_key:
-            resolved_key = speech_key
-        else:
-            resolved_key = deepseek_key
-
-        speech_url = os.getenv("SPEECH_API_URL", "")
-        deepseek_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-        if base_url is not None:
-            resolved_base = base_url
-        elif speech_url:
-            resolved_base = speech_url
-        elif resolved_key and resolved_key == deepseek_key:
-            # DeepSeek chat root is OpenAI-compatible at /chat/completions;
-            # speech path is usually under /v1 when a gateway exposes it.
-            root = deepseek_url.rstrip("/")
-            resolved_base = root if root.endswith("/v1") else f"{root}/v1"
-        else:
-            resolved_base = "https://api.openai.com/v1"
-
-        self.api_key = resolved_key or ""
-        self.base_url = (resolved_base or "https://api.openai.com/v1").rstrip("/")
-        self.model = model or os.getenv(
-            "SPEECH_API_MODEL",
-            os.getenv("DEEPSEEK_SPEECH_MODEL", "whisper-1"),
+        self.api_key = api_key if api_key is not None else os.getenv("SPEECH_API_KEY", "")
+        raw_base = base_url if base_url is not None else os.getenv(
+            "SPEECH_API_URL", "https://api.openai.com/v1"
         )
+        self.base_url = (raw_base or "https://api.openai.com/v1").rstrip("/")
+        self.model = model or os.getenv("SPEECH_API_MODEL", "whisper-1")
         self.language = language or os.getenv("SPEECH_API_LANG", "zh")
         self.timeout = timeout
-        self.provider = (
-            "speech-api"
-            if speech_key and resolved_key == speech_key
-            else "deepseek"
-            if resolved_key and resolved_key == deepseek_key
-            else "custom"
-            if resolved_key
-            else "none"
-        )
 
     @property
     def available(self) -> bool:
@@ -366,7 +333,6 @@ class OnlineSpeechRecognizer:
     def status(self) -> dict[str, Any]:
         return {
             "available": self.available,
-            "provider": self.provider,
             "base_url": self.base_url,
             "model": self.model,
             "language": self.language,
@@ -384,9 +350,7 @@ class OnlineSpeechRecognizer:
         if require_audible and not is_audible(samples, sample_rate):
             return ""
         if not self.api_key:
-            raise VoiceUnavailable(
-                "未设置 SPEECH_API_KEY 或 DEEPSEEK_API_KEY，在线语音识别不可用。"
-            )
+            raise VoiceUnavailable("未设置 SPEECH_API_KEY，在线语音识别不可用。")
 
         wav = encode_wav(samples, sample_rate)
         files = {"file": ("command.wav", wav, "audio/wav")}

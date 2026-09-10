@@ -1,0 +1,170 @@
+[world]
+width = 4096
+height = 2304
+tile_size = 32
+simulation_hz = 20
+subpixels = 256
+default_army_size = 500
+
+[ai.easy]
+strategy_interval_ticks = 60
+tactical_interval_ticks = 10
+max_simultaneous_tasks = 3
+planning_depth = 1
+allow_inspire = false
+aggression = 0.5
+retreat_hp_ratio = 0.15
+scout_count = 1
+
+[ai.normal]
+strategy_interval_ticks = 40
+tactical_interval_ticks = 5
+max_simultaneous_tasks = 4
+planning_depth = 2
+allow_inspire = false
+aggression = 0.7
+retreat_hp_ratio = 0.25
+scout_count = 2
+
+[ai.hard]
+strategy_interval_ticks = 30
+tactical_interval_ticks = 4
+max_simultaneous_tasks = 5
+planning_depth = 3
+allow_inspire = true
+aggression = 0.9
+retreat_hp_ratio = 0.35
+scout_count = 3
+
+[tactics]
+max_stamina = 100.0
+recovery_delay = 3.0
+recovery_per_second = 6.0
+sprint_duration = 6.0
+sprint_cost = 30.0
+sprint_speed_multiplier = 1.30
+charge_duration = 5.0
+charge_cost = 40.0
+charge_speed_multiplier = 1.20
+charge_damage_multiplier = 1.25
+charge_damage_duration = 2.0
+cooldown = 20.0
+full_effect_distance = 256.0
+max_effect_distance = 1024.0
+
+[units.recruit]
+hp = 100.0
+damage = 10.0
+attack_interval = 1.2
+speed = 25.0
+vision = 240.0
+detection = 80.0
+radius = 7.0
+attack_range = 20.0
+
+[units.infantry]
+hp = 120.0
+damage = 16.0
+attack_interval = 1.2
+speed = 24.0
+vision = 220.0
+detection = 64.0
+radius = 7.0
+attack_range = 20.0
+
+[units.scout]
+hp = 70.0
+damage = 8.0
+attack_interval = 1.4
+speed = 39.0
+vision = 420.0
+detection = 220.0
+radius = 6.0
+attack_range = 18.0
+
+[units.engineer]
+hp = 90.0
+damage = 9.0
+attack_interval = 1.5
+speed = 22.5
+vision = 220.0
+detection = 80.0
+radius = 7.0
+attack_range = 18.0
+
+[units.assassin]
+hp = 55.0
+damage = 45.0
+attack_interval = 1.8
+speed = 31.0
+vision = 260.0
+detection = 70.0
+radius = 6.0
+attack_range = 16.0
+
+[units.commander]
+hp = 120.0
+damage = 16.0
+attack_interval = 1.2
+speed = 24.0
+vision = 220.0
+detection = 64.0
+radius = 8.0
+attack_range = 20.0
+
+[units.guard]
+hp = 120.0
+damage = 16.0
+attack_interval = 1.2
+speed = 24.0
+vision = 220.0
+detection = 80.0
+radius = 8.0
+attack_range = 20.0
+
+[terrain.speed]
+plain = 1.0
+grass = 0.95
+forest = 0.6
+swamp = 0.4
+river = 0.2
+road = 1.1
+
+[terrain.vision]
+plain = 1.0
+grass = 0.75
+forest = 0.5
+swamp = 1.0
+river = 1.0
+road = 1.0
+
+[terrain]
+[facilities.bridge]
+work = 600.0
+minimum_engineers = 8
+hp = 600.0
+
+[facilities.boat]
+work = 300.0
+minimum_engineers = 4
+hp = 300.0
+capacity = 20
+destroyed_damage = 40.0
+speed = 27.5
+
+[facilities.road]
+work = 200.0
+minimum_engineers = 3
+hp = 1.0
+
+[facilities.tower]
+work = 800.0
+minimum_engineers = 10
+hp = 1000.0
+capacity = 20
+attack_range = 260.0
+vision = 360.0
+
+[facilities]
+engineer_work_per_second = 10.0
+minimum_build_seconds = 2.0
